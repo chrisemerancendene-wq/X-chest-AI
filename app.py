@@ -15,7 +15,7 @@ try:
 
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel('gemini-1.5-pro')
+    model = genai.GenerativeModel('gemini-1.5-flash')
 except Exception as e:
     st.error("⚠️ Erreur de configuration des Secrets. Vérifiez votre tableau de bord Streamlit.")
     st.stop()
