@@ -15,10 +15,21 @@ try:
 
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-except Exception as e:
-    st.error("⚠️ Erreur de configuration des Secrets. Vérifiez votre tableau de bord Streamlit.")
-    st.stop()
+    # --- CONFIGURATION DE L'IA ---
+import google.generativeai as genai
+
+# On récupère la clé que vous avez mise dans les Secrets Streamlit
+if "GEMINI_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_KEY"])
+else:
+    st.error("La clé API GEMINI_KEY est manquante dans les Secrets.")
+
+# On utilise le nom du modèle le plus récent pour éviter l'erreur 404
+# C'est celui qui correspond au "Gemini 3 Flash" que vous voyez sur votre écran
+MODEL_NAME = 'gemini-1.5-flash-latest' 
+
+model = genai.GenerativeModel(model_name=MODEL_NAME)
+
 
 # ══════════════════════════════════════════════════════
 # DESIGN DARK MODE
