@@ -6,30 +6,25 @@ import json
 from supabase import create_client, Client
 
 # ══════════════════════════════════════════════════════
-# CONFIGURATION — SECRETS (ne pas modifier)
+# CONFIGURATION — SECRETS & IA
 # ══════════════════════════════════════════════════════
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     GEMINI_KEY = st.secrets["GEMINI_KEY"]
 
+    # Connexion Supabase
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    # Configuration Gemini
     genai.configure(api_key=GEMINI_KEY)
-    # --- CONFIGURATION DE L'IA ---
-import google.generativeai as genai
+    
+    # On utilise le modèle Flash pour la rapidité et la compatibilité
+    MODEL_NAME = 'gemini-1.5-flash' 
+    model = genai.GenerativeModel(model_name=MODEL_NAME)
 
-# On récupère la clé que vous avez mise dans les Secrets Streamlit
-if "GEMINI_KEY" in st.secrets:
-    genai.configure(api_key=st.secrets["GEMINI_KEY"])
-else:
-    st.error("La clé API GEMINI_KEY est manquante dans les Secrets.")
-
-# On utilise le nom du modèle le plus récent pour éviter l'erreur 404
-# C'est celui qui correspond au "Gemini 3 Flash" que vous voyez sur votre écran
-MODEL_NAME = 'gemini-1.5-flash-latest' 
-
-model = genai.GenerativeModel(model_name=MODEL_NAME)
-
+except Exception as e:
+    st.error(f"Erreur de configuration (Vérifiez vos Secrets) : {e}")
 
 # ══════════════════════════════════════════════════════
 # DESIGN DARK MODE
@@ -62,13 +57,13 @@ Réponds UNIQUEMENT en JSON strict, sans markdown, sans backticks, sans texte su
 
 {
   "qualite": {
-    "champ_radiographique": {"resultat": "OUI" ou "NON", "justification": "..."},
-    "symetrie": {"resultat": "OUI" ou "NON", "justification": "..."},
-    "inspiration": {"resultat": "OUI" ou "NON", "justification": "..."},
-    "conclusion_globale": "Acceptable" ou "Non acceptable"
+    "champ_radiographique": {"resultat": "OUI", "justification": "..."},
+    "symetrie": {"resultat": "OUI", "justification": "..."},
+    "inspiration": {"resultat": "OUI", "justification": "..."},
+    "conclusion_globale": "Acceptable"
   },
   "diagnostic": {
-    "conclusion": "Normale" ou "Pathologique",
+    "conclusion": "Normale",
     "description_semiologique": "Explication en 2 à 3 phrases des signes radiologiques observés."
   }
 }
@@ -90,23 +85,17 @@ st.divider()
 # ══════════════════════════════════════════════════════
 col1, col2 = st.columns([1, 1.5])
 
-# ──────────────────────────────────────────────────────
-# COLONNE GAUCHE — Formulaire + Upload
-# ──────────────────────────────────────────────────────
 with col1:
-    st.subheader("📝 Identification de la radiographie")
-
+    st.subheader("📝 Identification")
     p_id = st.text_input("🏷️ Identifiant radio", placeholder="RAD_001")
     p_age = st.number_input("🎂 Âge du patient", min_value=18, max_value=120, value=30)
     p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"])
     img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'])
 
-    # Aperçu de l'image uploadée
     if img_file:
         img_preview = Image.open(img_file)
-        st.image(img_preview, caption=f"Radio chargée — {p_id}", use_column_width=True)
+        st.image(img_preview, caption=f"Radio chargée — {p_id}", use_container_width=True)
 
-    # Bouton analyser
     if st.button("🚀 ANALYSER ET SAUVEGARDER"):
         if not img_file:
             st.warning("⚠️ Veuillez uploader une radiographie.")
@@ -114,149 +103,51 @@ with col1:
             st.warning("⚠️ Veuillez renseigner l'identifiant radio.")
         else:
             img = Image.open(img_file)
-
-            with st.spinner("🔬 Gemini analyse la radiographie..."):
+            with st.spinner("🔬 Analyse en cours..."):
                 try:
-                    # ── Appel API Gemini ──
                     response = model.generate_content([PROMPT, img])
-                    raw = response.text.replace('```json', '').replace('```', '').strip()
-                    data = json.loads(raw)
+                    # Nettoyage du JSON au cas où l'IA ajoute des balises
+                    clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                    data = json.loads(clean_text)
 
-                    # ── Extraction des résultats ──
+                    # Extraction
                     qc = data['qualite']
                     diag = data['diagnostic']
 
-                    champ = qc['champ_radiographique']
-                    symetrie = qc['symetrie']
-                    inspiration = qc['inspiration']
-                    conclusion_qc = qc['conclusion_globale']
-                    classification = diag['conclusion']
-                    description = diag['description_semiologique']
+                    # Affichage
+                    st.success(f"✅ Analyse terminée pour {p_id}")
+                    st.json(data) # Optionnel : afficher le JSON brut pour vérifier
 
-                    # ── Affichage des résultats ──
-                    st.markdown("---")
-                    st.markdown("### 📊 Résultats de l'analyse")
-
-                    # Contrôle qualité
-                    st.markdown("#### 📐 Contrôle Qualité")
-                    qc_col1, qc_col2, qc_col3 = st.columns(3)
-
-                    with qc_col1:
-                        icon = "✅" if champ['resultat'] == "OUI" else "❌"
-                        couleur = "success" if champ['resultat'] == "OUI" else "error"
-                        getattr(st, couleur)(f"{icon} **Champ radio**\n\n{champ['resultat']}\n\n*{champ['justification']}*")
-
-                    with qc_col2:
-                        icon = "✅" if symetrie['resultat'] == "OUI" else "❌"
-                        couleur = "success" if symetrie['resultat'] == "OUI" else "error"
-                        getattr(st, couleur)(f"{icon} **Symétrie**\n\n{symetrie['resultat']}\n\n*{symetrie['justification']}*")
-
-                    with qc_col3:
-                        icon = "✅" if inspiration['resultat'] == "OUI" else "❌"
-                        couleur = "success" if inspiration['resultat'] == "OUI" else "error"
-                        getattr(st, couleur)(f"{icon} **Inspiration**\n\n{inspiration['resultat']}\n\n*{inspiration['justification']}*")
-
-                    # Conclusion QC globale
-                    if conclusion_qc == "Acceptable":
-                        st.success(f"✅ **Conclusion QC globale : {conclusion_qc}**")
-                    else:
-                        st.error(f"❌ **Conclusion QC globale : {conclusion_qc}**")
-
-                    st.markdown("---")
-
-                    # Classification sémiologique
-                    st.markdown("#### 🔍 Classification sémiologique")
-                    if classification == "Normale":
-                        st.success(f"## ✅ {classification}")
-                    else:
-                        st.error(f"## ⚠️ {classification}")
-
-                    st.info(f"**📝 Justification de l'IA :**\n\n{description}")
-
-                    st.markdown("---")
-
-                    # ── Sauvegarde Supabase ──
+                    # Sauvegarde Supabase
                     supabase.table("analyses").insert({
                         "patient_id": p_id,
                         "age": p_age,
                         "sexe": p_sexe,
-                        "champ_radiographique": champ['resultat'],
-                        "champ_justification": champ['justification'],
-                        "symetrie": symetrie['resultat'],
-                        "symetrie_justification": symetrie['justification'],
-                        "inspiration": inspiration['resultat'],
-                        "inspiration_justification": inspiration['justification'],
-                        "conclusion_qc": conclusion_qc,
-                        "diagnostic": classification,
-                        "description": description,
-                        "classification_radiologue": "",
-                        "conclusion_qc_radiologue": "",
-                        "delai_minutes": None
+                        "champ_radiographique": qc['champ_radiographique']['resultat'],
+                        "champ_justification": qc['champ_radiographique']['justification'],
+                        "symetrie": qc['symetrie']['resultat'],
+                        "symetrie_justification": qc['symetrie']['justification'],
+                        "inspiration": qc['inspiration']['resultat'],
+                        "inspiration_justification": qc['inspiration']['justification'],
+                        "conclusion_qc": qc['conclusion_globale'],
+                        "diagnostic": diag['conclusion'],
+                        "description": diag['description_semiologique']
                     }).execute()
+                    
+                    st.success("💾 Données sauvegardées avec succès !")
 
-                    st.success(f"✅ Analyse de **{p_id}** sauvegardée dans Supabase !")
-
-                except json.JSONDecodeError:
-                    st.error("⚠️ Réponse de l'IA non interprétable. Veuillez réessayer.")
                 except Exception as e:
-                    st.error(f"⚠️ Erreur : {str(e)}")
+                    st.error(f"⚠️ Erreur lors de l'analyse : {e}")
 
-# ──────────────────────────────────────────────────────
-# COLONNE DROITE — Historique
-# ──────────────────────────────────────────────────────
 with col2:
     st.subheader("📜 Historique des analyses")
-
     try:
         history = supabase.table("analyses").select("*").order('created_at', desc=True).limit(10).execute()
-
         if history.data:
             for row in history.data:
-                icon = "✅" if row.get('diagnostic') == "Normale" else "⚠️"
-                qc_icon = "✅" if row.get('conclusion_qc') == "Acceptable" else "❌"
-                with st.expander(f"{icon} {row['patient_id']} — {row.get('diagnostic', '?')} | QC : {qc_icon} {row.get('conclusion_qc', '?')}"):
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.write(f"**Âge :** {row.get('age', '?')} ans")
-                        st.write(f"**Sexe :** {row.get('sexe', '?')}")
-                        st.write(f"**Champ radio :** {row.get('champ_radiographique', '?')}")
-                        st.write(f"**Symétrie :** {row.get('symetrie', '?')}")
-                        st.write(f"**Inspiration :** {row.get('inspiration', '?')}")
-                    with col_b:
-                        st.write(f"**Conclusion QC :** {row.get('conclusion_qc', '?')}")
-                        st.write(f"**Classification :** {row.get('diagnostic', '?')}")
-                        st.write(f"**CR Radiologue :** {row.get('classification_radiologue') or '— à compléter'}")
-                        st.write(f"**Délai (min) :** {row.get('delai_minutes') or '— à compléter'}")
-                    st.caption(f"📝 {row.get('description', '')}")
+                with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
+                    st.write(f"**Description :** {row['description']}")
         else:
-            st.info("Aucune analyse effectuée pour le moment.")
-
-    except Exception as e:
-        st.error(f"Erreur de chargement de l'historique : {str(e)}")
-
-    # ── Export CSV ──
-    st.markdown("---")
-    st.subheader("📊 Export des données")
-    if st.button("⬇️ Télécharger toutes les analyses (CSV)"):
-        try:
-            all_data = supabase.table("analyses").select("*").order('created_at', desc=True).execute()
-            if all_data.data:
-                df = pd.DataFrame(all_data.data)
-                cols = ['patient_id', 'age', 'sexe', 'champ_radiographique', 'symetrie',
-                        'inspiration', 'conclusion_qc', 'diagnostic', 'description',
-                        'classification_radiologue', 'conclusion_qc_radiologue', 'delai_minutes', 'created_at']
-                df = df[[c for c in cols if c in df.columns]]
-                df.columns = ['ID_Radio', 'Age', 'Sexe', 'Champ_IA', 'Symetrie_IA',
-                              'Inspiration_IA', 'Conclusion_QC_IA', 'Classification_IA', 'Justification_IA',
-                              'Classification_Radiologue', 'Conclusion_QC_Radiologue', 'Delai_minutes', 'Date']
-                csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig')
-                st.download_button(
-                    label="📥 Cliquez ici pour télécharger",
-                    data=csv,
-                    file_name="RadioIA_Export.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.info("Aucune donnée à exporter.")
-        except Exception as e:
-            st.error(f"Erreur d'export : {str(e)}")
+            st.info("Aucun historique disponible.")
+    except:
+        st.info("En attente de données...")
