@@ -6,8 +6,17 @@ import json
 from supabase import create_client, Client
 
 # ══════════════════════════════════════════════════════
+# CONFIGURATION DE LA PAGE
+# st.set_page_config doit être la première commande Streamlit.
+# ══════════════════════════════════════════════════════
+st.set_page_config(page_title="RadioIA — Jamot", layout="wide", page_icon="🫁")
+
+# ══════════════════════════════════════════════════════
 # CONFIGURATION — SECRETS & IA
 # ══════════════════════════════════════════════════════
+supabase = None
+model = None
+
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -19,8 +28,8 @@ try:
     # Configuration Gemini
     genai.configure(api_key=GEMINI_KEY)
     
-    # On utilise le modèle Flash pour la rapidité et la compatibilité
-    MODEL_NAME = 'gemini-2.0-flash-exp' 
+    # On utilise un modèle Flash récent compatible avec generateContent.
+    MODEL_NAME = 'gemini-2.5-flash'
     model = genai.GenerativeModel(model_name=MODEL_NAME)
 
 except Exception as e:
@@ -29,7 +38,6 @@ except Exception as e:
 # ══════════════════════════════════════════════════════
 # DESIGN DARK MODE
 # ══════════════════════════════════════════════════════
-st.set_page_config(page_title="RadioIA — Jamot", layout="wide", page_icon="🫁")
 st.markdown("""
 <style>
 .stApp { background-color: #0E1117; color: white; }
@@ -93,20 +101,25 @@ with col1:
     img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'])
 
     if img_file:
+        img_file.seek(0)
         img_preview = Image.open(img_file)
         st.image(img_preview, caption=f"Radio chargée — {p_id}", use_container_width=True)
 
     if st.button("🚀 ANALYSER ET SAUVEGARDER"):
-        if not img_file:
+        if model is None or supabase is None:
+            st.error("⚠️ Configuration incomplète : vérifiez vos Secrets Streamlit.")
+        elif not img_file:
             st.warning("⚠️ Veuillez uploader une radiographie.")
         elif not p_id:
             st.warning("⚠️ Veuillez renseigner l'identifiant radio.")
         else:
+            img_file.seek(0)
             img = Image.open(img_file)
             with st.spinner("🔬 Analyse en cours..."):
                 try:
                     response = model.generate_content([PROMPT, img])
-                    # Nettoyage du JSON au cas où l'IA ajoute des balises
+                    
+                    # Nettoyage du JSON au cas où l'IA ajoute des balises.
                     clean_text = response.text.replace('```json', '').replace('```', '').strip()
                     data = json.loads(clean_text)
 
@@ -136,18 +149,29 @@ with col1:
                     
                     st.success("💾 Données sauvegardées avec succès !")
 
+                except json.JSONDecodeError as e:
+                    st.error(f"⚠️ L'IA n'a pas renvoyé un JSON valide : {e}")
+                    if 'response' in locals():
+                        st.code(response.text, language="text")
+                except KeyError as e:
+                    st.error(f"⚠️ Clé manquante dans la réponse JSON : {e}")
+                    if 'data' in locals():
+                        st.json(data)
                 except Exception as e:
                     st.error(f"⚠️ Erreur lors de l'analyse : {e}")
 
 with col2:
     st.subheader("📜 Historique des analyses")
     try:
-        history = supabase.table("analyses").select("*").order('created_at', desc=True).limit(10).execute()
-        if history.data:
-            for row in history.data:
-                with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
-                    st.write(f"**Description :** {row['description']}")
+        if supabase is None:
+            st.info("En attente de configuration Supabase...")
         else:
-            st.info("Aucun historique disponible.")
-    except:
-        st.info("En attente de données...")
+            history = supabase.table("analyses").select("*").order('created_at', desc=True).limit(10).execute()
+            if history.data:
+                for row in history.data:
+                    with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
+                        st.write(f"**Description :** {row['description']}")
+            else:
+                st.info("Aucun historique disponible.")
+    except Exception as e:
+        st.info(f"En attente de données... ({e})")
