@@ -1,7 +1,7 @@
 import streamlit as st
 import google.generativeai as genai
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 import json
 from supabase import create_client, Client
 
@@ -71,15 +71,105 @@ Réponds UNIQUEMENT en JSON strict, sans markdown, sans backticks, sans texte su
     "conclusion_globale": "Acceptable"
   },
   "diagnostic": {
-    "conclusion": "Normale",
+    "conclusion": "Normal ou Pathologique",
     "description_semiologique": "Explication en 2 à 3 phrases des signes radiologiques observés."
+  },
+  "reperes_visuels": {
+    "symetrie": {
+      "ligne_mediane": [[500, 80], [500, 900]],
+      "lignes_clavicules": [
+        [[380, 210], [470, 260]],
+        [[620, 210], [530, 260]]
+      ]
+    },
+    "inspiration": {
+      "arcs_costaux": [
+        {"bbox": [180, 180, 480, 520], "start": 210, "end": 330},
+        {"bbox": [520, 180, 820, 520], "start": 210, "end": 330}
+      ]
+    },
+    "pathologie": {
+      "fleches": [
+        {"depart": [850, 250], "arrivee": [650, 430], "label": "anomalie suspecte"}
+      ]
+    }
   }
 }
 
 Critères d'évaluation :
 - Champ radiographique : les apex pulmonaires et les culs de sac costo-diaphragmatiques sont-ils entièrement visibles ?
 - Symétrie : les bords internes des clavicules sont-ils équidistants des apophyses épineuses ?
-- Inspiration : au moins 7 à 9 arcs costaux postérieurs sont-ils visibles ?"""
+- Inspiration : au moins 7 à 9 arcs costaux postérieurs sont-ils visibles ?
+- Diagnostic : la conclusion doit être exactement "Normal" ou "Pathologique".
+
+Instructions pour les repères visuels :
+- Utilise des coordonnées normalisées de 0 à 1000, où [0,0] correspond au coin supérieur gauche de l'image et [1000,1000] au coin inférieur droit.
+- Les repères doivent être approximatifs mais cohérents avec l'image.
+- ligne_mediane illustre l'axe de symétrie thoracique.
+- lignes_clavicules illustrent la comparaison des clavicules pour la symétrie.
+- arcs_costaux illustre les arcs costaux visibles pour l'inspiration.
+- fleches indique uniquement les anomalies visibles. Si aucune anomalie n'est visible, retourne "fleches": []."""
+
+
+def dessiner_reperes_visuels(image, data):
+    annotated = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(annotated)
+    width, height = annotated.size
+    line_width = max(3, width // 180)
+
+    def point(coord):
+        x = max(0, min(1000, float(coord[0])))
+        y = max(0, min(1000, float(coord[1])))
+        return int(x * width / 1000), int(y * height / 1000)
+
+    def box(coords):
+        x1, y1 = point(coords[:2])
+        x2, y2 = point(coords[2:])
+        return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+
+    def arrow(start, end, color):
+        x1, y1 = point(start)
+        x2, y2 = point(end)
+        draw.line((x1, y1, x2, y2), fill=color, width=line_width)
+        dx, dy = x2 - x1, y2 - y1
+        length = max((dx * dx + dy * dy) ** 0.5, 1)
+        ux, uy = dx / length, dy / length
+        size = line_width * 5
+        left = (x2 - ux * size - uy * size * 0.6, y2 - uy * size + ux * size * 0.6)
+        right = (x2 - ux * size + uy * size * 0.6, y2 - uy * size - ux * size * 0.6)
+        draw.polygon([(x2, y2), left, right], fill=color)
+
+    reperes = data.get("reperes_visuels", {})
+    symetrie = reperes.get("symetrie", {})
+    inspiration = reperes.get("inspiration", {})
+    pathologie = reperes.get("pathologie", {})
+
+    if symetrie.get("ligne_mediane"):
+        p1, p2 = symetrie["ligne_mediane"]
+        draw.line((*point(p1), *point(p2)), fill=(0, 180, 255), width=line_width)
+
+    for ligne in symetrie.get("lignes_clavicules", []):
+        if len(ligne) == 2:
+            draw.line((*point(ligne[0]), *point(ligne[1])), fill=(255, 210, 0), width=line_width)
+
+    for arc in inspiration.get("arcs_costaux", []):
+        if "bbox" in arc:
+            draw.arc(
+                box(arc["bbox"]),
+                start=int(arc.get("start", 200)),
+                end=int(arc.get("end", 340)),
+                fill=(0, 255, 120),
+                width=line_width,
+            )
+
+    for fleche in pathologie.get("fleches", []):
+        if fleche.get("depart") and fleche.get("arrivee"):
+            arrow(fleche["depart"], fleche["arrivee"], (255, 40, 40))
+            label = fleche.get("label", "anomalie")
+            tx, ty = point(fleche["depart"])
+            draw.text((tx + 8, ty + 8), label, fill=(255, 40, 40))
+
+    return annotated
 
 # ══════════════════════════════════════════════════════
 # TITRE
@@ -129,6 +219,8 @@ with col1:
 
                     # Affichage
                     st.success(f"✅ Analyse terminée pour {p_id}")
+                    img_annotee = dessiner_reperes_visuels(img, data)
+                    st.image(img_annotee, caption="Radiographie avec repères visuels proposés par l'IA", use_container_width=True)
                     st.json(data) # Optionnel : afficher le JSON brut pour vérifier
 
                     # Sauvegarde Supabase
