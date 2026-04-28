@@ -20,7 +20,7 @@ try:
     genai.configure(api_key=GEMINI_KEY)
     
     # On utilise le modèle Flash pour la rapidité et la compatibilité
-    MODEL_NAME = 'gemini-1.5-flash' 
+    MODEL_NAME = 'gemini-2.0-flash-exp' 
     model = genai.GenerativeModel(model_name=MODEL_NAME)
 
 except Exception as e:
