@@ -3,6 +3,7 @@ import google.generativeai as genai
 import pandas as pd
 from PIL import Image, ImageDraw
 import json
+import time
 from supabase import create_client, Client
 
 # ══════════════════════════════════════════════════════
@@ -16,6 +17,7 @@ st.set_page_config(page_title="RadioIA — Jamot", layout="wide", page_icon="�
 # ══════════════════════════════════════════════════════
 supabase = None
 model = None
+COOLDOWN_SECONDS = 60
 
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -117,6 +119,31 @@ def dessiner_reperes_visuels(image, data):
     width, height = annotated.size
     line_width = max(3, width // 180)
 
+    # Les repères de qualité sont dessinés avec des proportions anatomiques
+    # simples pour éviter les coordonnées trop variables renvoyées par l'IA.
+    mid_x = width // 2
+    draw.line((mid_x, int(height * 0.08), mid_x, int(height * 0.92)), fill=(0, 180, 255), width=line_width)
+    draw.text((mid_x + 10, int(height * 0.08)), "axe de symetrie", fill=(0, 180, 255))
+
+    left_clavicle = (int(width * 0.30), int(height * 0.23), int(width * 0.47), int(height * 0.30))
+    right_clavicle = (int(width * 0.70), int(height * 0.23), int(width * 0.53), int(height * 0.30))
+    draw.line(left_clavicle, fill=(255, 210, 0), width=line_width)
+    draw.line(right_clavicle, fill=(255, 210, 0), width=line_width)
+    draw.text((int(width * 0.28), int(height * 0.18)), "clavicules", fill=(255, 210, 0))
+
+    rib_color = (0, 255, 120)
+    for side in (0.33, 0.67):
+        for i in range(5):
+            y = 0.35 + i * 0.075
+            bbox = (
+                int(width * (side - 0.19)),
+                int(height * (y - 0.12)),
+                int(width * (side + 0.19)),
+                int(height * (y + 0.18)),
+            )
+            draw.arc(bbox, start=205, end=335, fill=rib_color, width=line_width)
+    draw.text((int(width * 0.08), int(height * 0.62)), "arcs costaux / inspiration", fill=rib_color)
+
     def point(coord):
         x = max(0, min(1000, float(coord[0])))
         y = max(0, min(1000, float(coord[1])))
@@ -140,28 +167,15 @@ def dessiner_reperes_visuels(image, data):
         draw.polygon([(x2, y2), left, right], fill=color)
 
     reperes = data.get("reperes_visuels", {})
-    symetrie = reperes.get("symetrie", {})
-    inspiration = reperes.get("inspiration", {})
     pathologie = reperes.get("pathologie", {})
+    diagnostic = data.get("diagnostic", {})
+    conclusion = str(diagnostic.get("conclusion", "")).lower()
 
-    if symetrie.get("ligne_mediane"):
-        p1, p2 = symetrie["ligne_mediane"]
-        draw.line((*point(p1), *point(p2)), fill=(0, 180, 255), width=line_width)
+    if "path" not in conclusion:
+        return annotated
 
-    for ligne in symetrie.get("lignes_clavicules", []):
-        if len(ligne) == 2:
-            draw.line((*point(ligne[0]), *point(ligne[1])), fill=(255, 210, 0), width=line_width)
-
-    for arc in inspiration.get("arcs_costaux", []):
-        if "bbox" in arc:
-            draw.arc(
-                box(arc["bbox"]),
-                start=int(arc.get("start", 200)),
-                end=int(arc.get("end", 340)),
-                fill=(0, 255, 120),
-                width=line_width,
-            )
-
+    # Les flèches pathologiques restent dépendantes de l'IA : elles ne sont
+    # dessinées que si Gemini fournit explicitement une zone suspecte.
     for fleche in pathologie.get("fleches", []):
         if fleche.get("depart") and fleche.get("arrivee"):
             arrow(fleche["depart"], fleche["arrivee"], (255, 40, 40))
@@ -190,12 +204,19 @@ with col1:
     p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"])
     img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'])
 
+    last_analysis_time = st.session_state.get("last_analysis_time", 0)
+    remaining_wait = int(COOLDOWN_SECONDS - (time.time() - last_analysis_time))
+    remaining_wait = max(0, remaining_wait)
+
     if img_file:
         img_file.seek(0)
         img_preview = Image.open(img_file)
         st.image(img_preview, caption=f"Radio chargée — {p_id}", use_container_width=True)
 
-    if st.button("🚀 ANALYSER ET SAUVEGARDER"):
+    if remaining_wait > 0:
+        st.info(f"⏳ Patientez encore {remaining_wait} seconde(s) avant une nouvelle analyse.")
+
+    if st.button("🚀 ANALYSER ET SAUVEGARDER", disabled=remaining_wait > 0):
         if model is None or supabase is None:
             st.error("⚠️ Configuration incomplète : vérifiez vos Secrets Streamlit.")
         elif not img_file:
@@ -207,6 +228,7 @@ with col1:
             img = Image.open(img_file)
             with st.spinner("🔬 Analyse en cours..."):
                 try:
+                    st.session_state["last_analysis_time"] = time.time()
                     response = model.generate_content([PROMPT, img])
                     
                     # Nettoyage du JSON au cas où l'IA ajoute des balises.
@@ -216,15 +238,23 @@ with col1:
                     # Extraction
                     qc = data['qualite']
                     diag = data['diagnostic']
+                    conclusion = str(diag.get('conclusion', '')).strip()
+                    if 'path' in conclusion.lower():
+                        diag['conclusion'] = 'Pathologique'
+                    elif 'normal' in conclusion.lower() or 'normale' in conclusion.lower():
+                        diag['conclusion'] = 'Normal'
 
                     # Affichage
                     st.success(f"✅ Analyse terminée pour {p_id}")
                     img_annotee = dessiner_reperes_visuels(img, data)
-                    st.image(img_annotee, caption="Radiographie avec repères visuels proposés par l'IA", use_container_width=True)
-                    st.json(data) # Optionnel : afficher le JSON brut pour vérifier
+                    st.image(img_annotee, caption="Radiographie annotée", use_container_width=True)
+                    st.markdown(f"**Classification :** {diag['conclusion']}")
+                    st.markdown(f"**Analyse sémiologique :** {diag['description_semiologique']}")
 
-                    # Sauvegarde Supabase
-                    supabase.table("analyses").insert({
+                    if st.checkbox("Afficher les données techniques JSON", value=False):
+                        st.json(data)
+
+                    row_data = {
                         "patient_id": p_id,
                         "age": p_age,
                         "sexe": p_sexe,
@@ -237,9 +267,19 @@ with col1:
                         "conclusion_qc": qc['conclusion_globale'],
                         "diagnostic": diag['conclusion'],
                         "description": diag['description_semiologique']
-                    }).execute()
-                    
-                    st.success("💾 Données sauvegardées avec succès !")
+                    }
+
+                    if "recent_analyses" not in st.session_state:
+                        st.session_state["recent_analyses"] = []
+                    st.session_state["recent_analyses"].insert(0, row_data)
+                    st.session_state["recent_analyses"] = st.session_state["recent_analyses"][:10]
+
+                    # Sauvegarde Supabase
+                    try:
+                        supabase.table("analyses").insert(row_data).execute()
+                        st.success("💾 Données sauvegardées avec succès !")
+                    except Exception as save_error:
+                        st.warning(f"Analyse affichée, mais sauvegarde Supabase non effectuée : {save_error}")
 
                 except json.JSONDecodeError as e:
                     st.error(f"⚠️ L'IA n'a pas renvoyé un JSON valide : {e}")
@@ -250,7 +290,11 @@ with col1:
                     if 'data' in locals():
                         st.json(data)
                 except Exception as e:
-                    st.error(f"⚠️ Erreur lors de l'analyse : {e}")
+                    if "429" in str(e) or "quota" in str(e).lower():
+                        st.error("⚠️ Quota Gemini temporairement dépassé. Patientez environ 1 minute, puis réessayez.")
+                        st.info("Cette limite peut aussi être atteinte si la même clé API est utilisée ailleurs ou si plusieurs essais ont été faits récemment.")
+                    else:
+                        st.error(f"⚠️ Erreur lors de l'analyse : {e}")
 
 with col2:
     st.subheader("📜 Historique des analyses")
@@ -264,6 +308,15 @@ with col2:
                     with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
                         st.write(f"**Description :** {row['description']}")
             else:
-                st.info("Aucun historique disponible.")
+                st.info("Aucun historique Supabase disponible.")
     except Exception as e:
-        st.info(f"En attente de données... ({e})")
+        st.info(f"Historique Supabase indisponible : {e}")
+
+    local_history = st.session_state.get("recent_analyses", [])
+    if local_history:
+        st.markdown("### Historique de cette session")
+        for row in local_history:
+            with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
+                st.write(f"**Âge :** {row.get('age', 'N/A')} | **Sexe :** {row.get('sexe', 'N/A')}")
+                st.write(f"**Qualité :** {row.get('conclusion_qc', 'N/A')}")
+                st.write(f"**Description :** {row.get('description', 'N/A')}")
