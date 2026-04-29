@@ -100,6 +100,22 @@ def afficher_classification(conclusion, description):
     )
 
 
+def afficher_conformite_globale(conclusion):
+    conclusion_clean = str(conclusion).strip()
+    is_ok = conclusion_clean.lower() == "conforme"
+    color = "#22c55e" if is_ok else "#ef4444"
+    bg = "rgba(34, 197, 94, 0.14)" if is_ok else "rgba(239, 68, 68, 0.14)"
+    st.markdown(
+        f"""
+        <div style="background: {bg}; border: 1px solid {color}; border-radius: 10px; padding: 0.9rem 1rem; margin: 0.75rem 0 1rem 0;">
+            <div style="font-size: 0.95rem; color: #d7deea;">Conclusion QC globale</div>
+            <div style="font-size: 1.35rem; font-weight: 900; color: {color}; margin-top: 0.15rem;">{html.escape(conclusion_clean)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def afficher_image_zoomable(image, caption="Radiographie annotée"):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -141,7 +157,7 @@ Réponds UNIQUEMENT en JSON strict, sans markdown, sans backticks, sans texte su
     "champ_radiographique": {"resultat": "OUI", "justification": "..."},
     "symetrie": {"resultat": "OUI", "justification": "..."},
     "inspiration": {"resultat": "OUI", "justification": "..."},
-    "conclusion_globale": "Acceptable"
+    "conclusion_globale": "Conforme ou Non conforme"
   },
   "diagnostic": {
     "conclusion": "Normal ou Pathologique",
@@ -173,6 +189,7 @@ Critères d'évaluation :
 - Champ radiographique : les apex pulmonaires et les culs de sac costo-diaphragmatiques sont-ils entièrement visibles ?
 - Symétrie : les bords internes des clavicules sont-ils équidistants des apophyses épineuses ?
 - Inspiration : au moins 7 à 9 arcs costaux postérieurs sont-ils visibles ?
+- Conclusion QC globale : réponds exactement "Conforme" si et seulement si champ_radiographique, symetrie et inspiration sont tous les trois à "OUI". Si au moins un seul critère est à "NON", réponds exactement "Non conforme".
 - Diagnostic : la conclusion doit être exactement "Normal" ou "Pathologique".
 
 Instructions pour les repères visuels :
@@ -334,6 +351,13 @@ with col1:
                     elif 'normal' in conclusion.lower() or 'normale' in conclusion.lower():
                         diag['conclusion'] = 'Normal'
 
+                    criteres_qc = [
+                        str(qc['champ_radiographique']['resultat']).strip().upper(),
+                        str(qc['symetrie']['resultat']).strip().upper(),
+                        str(qc['inspiration']['resultat']).strip().upper(),
+                    ]
+                    qc['conclusion_globale'] = "Conforme" if all(c == "OUI" for c in criteres_qc) else "Non conforme"
+
                     # Affichage
                     st.success(f"✅ Analyse terminée pour {p_id}")
                     img_annotee = dessiner_reperes_visuels(img, data)
@@ -355,7 +379,7 @@ with col1:
                         qc['inspiration']['resultat'],
                         qc['inspiration']['justification'],
                     )
-                    st.markdown(f"**Conclusion QC globale :** {qc['conclusion_globale']}")
+                    afficher_conformite_globale(qc['conclusion_globale'])
 
                     st.markdown("### Lecture des repères visuels")
                     st.markdown(
