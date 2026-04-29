@@ -118,22 +118,39 @@ def dessiner_reperes_visuels(image, data):
     draw = ImageDraw.Draw(annotated)
     width, height = annotated.size
     line_width = max(3, width // 180)
+    qc = data.get("qualite", {})
+
+    def resultat(critere):
+        valeur = qc.get(critere, {}).get("resultat", "")
+        return str(valeur).upper() if valeur else "?"
 
     # Les repères de qualité sont dessinés avec des proportions anatomiques
     # simples pour éviter les coordonnées trop variables renvoyées par l'IA.
+    field_color = (190, 120, 255)
+    margin_x = int(width * 0.08)
+    top_y = int(height * 0.08)
+    bottom_y = int(height * 0.92)
+    draw.rectangle((margin_x, top_y, width - margin_x, bottom_y), outline=field_color, width=line_width)
+    draw.text((margin_x + 8, top_y + 8), f"Champ radiographique: {resultat('champ_radiographique')}", fill=field_color)
+    draw.text((margin_x + 8, top_y + int(height * 0.04)), "apex visibles", fill=field_color)
+    draw.text((margin_x + 8, bottom_y - int(height * 0.05)), "culs-de-sac costo-diaphragmatiques", fill=field_color)
+
     mid_x = width // 2
-    draw.line((mid_x, int(height * 0.08), mid_x, int(height * 0.92)), fill=(0, 180, 255), width=line_width)
-    draw.text((mid_x + 10, int(height * 0.08)), "axe de symetrie", fill=(0, 180, 255))
+    draw.line((mid_x, top_y, mid_x, bottom_y), fill=(0, 180, 255), width=line_width)
+    draw.text((mid_x + 10, top_y), f"Symetrie: {resultat('symetrie')}", fill=(0, 180, 255))
+    draw.text((mid_x + 10, top_y + int(height * 0.04)), "axe epineux median", fill=(0, 180, 255))
 
     left_clavicle = (int(width * 0.30), int(height * 0.23), int(width * 0.47), int(height * 0.30))
     right_clavicle = (int(width * 0.70), int(height * 0.23), int(width * 0.53), int(height * 0.30))
     draw.line(left_clavicle, fill=(255, 210, 0), width=line_width)
     draw.line(right_clavicle, fill=(255, 210, 0), width=line_width)
-    draw.text((int(width * 0.28), int(height * 0.18)), "clavicules", fill=(255, 210, 0))
+    draw.line((int(width * 0.47), int(height * 0.30), mid_x, int(height * 0.30)), fill=(255, 210, 0), width=max(1, line_width // 2))
+    draw.line((int(width * 0.53), int(height * 0.30), mid_x, int(height * 0.30)), fill=(255, 210, 0), width=max(1, line_width // 2))
+    draw.text((int(width * 0.25), int(height * 0.18)), "clavicules equidistantes de l'axe", fill=(255, 210, 0))
 
     rib_color = (0, 255, 120)
     for side in (0.33, 0.67):
-        for i in range(5):
+        for i in range(7):
             y = 0.35 + i * 0.075
             bbox = (
                 int(width * (side - 0.19)),
@@ -142,7 +159,9 @@ def dessiner_reperes_visuels(image, data):
                 int(height * (y + 0.18)),
             )
             draw.arc(bbox, start=205, end=335, fill=rib_color, width=line_width)
-    draw.text((int(width * 0.08), int(height * 0.62)), "arcs costaux / inspiration", fill=rib_color)
+            if side < 0.5:
+                draw.text((int(width * 0.12), int(height * (y + 0.02))), str(i + 1), fill=rib_color)
+    draw.text((int(width * 0.08), int(height * 0.62)), f"Inspiration: {resultat('inspiration')} - 7 arcs posterieurs", fill=rib_color)
 
     def point(coord):
         x = max(0, min(1000, float(coord[0])))
@@ -248,6 +267,31 @@ with col1:
                     st.success(f"✅ Analyse terminée pour {p_id}")
                     img_annotee = dessiner_reperes_visuels(img, data)
                     st.image(img_annotee, caption="Radiographie annotée", use_container_width=True)
+
+                    st.markdown("### Résultats qualité")
+                    st.markdown(
+                        f"**Champ radiographique :** {qc['champ_radiographique']['resultat']}  \n"
+                        f"{qc['champ_radiographique']['justification']}"
+                    )
+                    st.markdown(
+                        f"**Symétrie :** {qc['symetrie']['resultat']}  \n"
+                        f"{qc['symetrie']['justification']}"
+                    )
+                    st.markdown(
+                        f"**Inspiration :** {qc['inspiration']['resultat']}  \n"
+                        f"{qc['inspiration']['justification']}"
+                    )
+                    st.markdown(f"**Conclusion QC globale :** {qc['conclusion_globale']}")
+
+                    st.markdown("### Lecture des repères visuels")
+                    st.markdown(
+                        "- **Violet :** vérifie que le champ inclut les apex et les culs-de-sac costo-diaphragmatiques.\n"
+                        "- **Bleu/jaune :** compare l'axe médian aux clavicules pour juger la rotation et la symétrie.\n"
+                        "- **Vert :** matérialise le comptage des arcs costaux postérieurs pour l'inspiration.\n"
+                        "- **Rouge :** indique une anomalie seulement si l'IA classe l'image comme pathologique."
+                    )
+
+                    st.markdown("### Diagnostic")
                     st.markdown(f"**Classification :** {diag['conclusion']}")
                     st.markdown(f"**Analyse sémiologique :** {diag['description_semiologique']}")
 
