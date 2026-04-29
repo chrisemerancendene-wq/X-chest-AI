@@ -4,6 +4,10 @@ import pandas as pd
 from PIL import Image, ImageDraw
 import json
 import time
+import io
+import base64
+import html
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 # ══════════════════════════════════════════════════════
@@ -57,6 +61,73 @@ st.markdown("""
 }
 </style>
 """, unsafe_allow_html=True)
+
+
+def afficher_critere(titre, resultat, justification):
+    resultat_clean = str(resultat).strip().upper()
+    is_ok = resultat_clean == "OUI"
+    color = "#22c55e" if is_ok else "#ef4444"
+    bg = "rgba(34, 197, 94, 0.14)" if is_ok else "rgba(239, 68, 68, 0.14)"
+    border = "rgba(34, 197, 94, 0.45)" if is_ok else "rgba(239, 68, 68, 0.45)"
+    st.markdown(
+        f"""
+        <div style="border-left: 4px solid {color}; background: {bg}; border: 1px solid {border}; padding: 0.85rem 1rem; border-radius: 10px; margin-bottom: 0.75rem;">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
+                <strong style="font-size: 1rem; color: #ffffff;">{html.escape(titre)}</strong>
+                <span style="background: {color}; color: white; padding: 0.2rem 0.65rem; border-radius: 999px; font-weight: 800;">{html.escape(resultat_clean)}</span>
+            </div>
+            <div style="margin-top: 0.45rem; color: #d7deea; line-height: 1.45;">{html.escape(str(justification))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def afficher_classification(conclusion, description):
+    conclusion_clean = str(conclusion).strip()
+    is_normal = conclusion_clean.lower() == "normal"
+    color = "#22c55e" if is_normal else "#ef4444"
+    bg = "rgba(34, 197, 94, 0.14)" if is_normal else "rgba(239, 68, 68, 0.14)"
+    st.markdown(
+        f"""
+        <div style="background: {bg}; border: 1px solid {color}; border-radius: 12px; padding: 1rem; margin-bottom: 0.75rem;">
+            <div style="font-size: 1rem; color: #d7deea;">Classification</div>
+            <div style="font-size: 1.5rem; font-weight: 900; color: {color}; margin-top: 0.15rem;">{html.escape(conclusion_clean)}</div>
+            <div style="margin-top: 0.75rem; color: #ffffff; line-height: 1.5;">{html.escape(str(description))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def afficher_image_zoomable(image, caption="Radiographie annotée"):
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    components.html(
+        f"""
+        <div style="font-family: sans-serif; color: white; background: #0E1117; padding: 0;">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.6rem;">
+                <strong>{html.escape(caption)}</strong>
+                <label style="font-size: 0.9rem; color: #cbd5e1;">Zoom : <span id="zoomValue">140%</span></label>
+            </div>
+            <input id="zoomSlider" type="range" min="80" max="300" value="140" step="10" style="width: 100%; margin-bottom: 0.75rem;">
+            <div style="height: 620px; overflow: auto; border: 1px solid #1a3050; border-radius: 12px; background: #05070c;">
+                <img id="radioImage" src="data:image/png;base64,{encoded}" style="width: 140%; max-width: none; display: block;">
+            </div>
+            <script>
+                const slider = document.getElementById('zoomSlider');
+                const image = document.getElementById('radioImage');
+                const value = document.getElementById('zoomValue');
+                slider.addEventListener('input', function() {{
+                    image.style.width = slider.value + '%';
+                    value.textContent = slider.value + '%';
+                }});
+            </script>
+        </div>
+        """,
+        height=710,
+    )
 
 # ══════════════════════════════════════════════════════
 # PROMPT COMPLET ET PRÉCIS
@@ -266,20 +337,23 @@ with col1:
                     # Affichage
                     st.success(f"✅ Analyse terminée pour {p_id}")
                     img_annotee = dessiner_reperes_visuels(img, data)
-                    st.image(img_annotee, caption="Radiographie annotée", use_container_width=True)
+                    afficher_image_zoomable(img_annotee, caption="Radiographie annotée avec repères visuels")
 
                     st.markdown("### Résultats qualité")
-                    st.markdown(
-                        f"**Champ radiographique :** {qc['champ_radiographique']['resultat']}  \n"
-                        f"{qc['champ_radiographique']['justification']}"
+                    afficher_critere(
+                        "Champ radiographique",
+                        qc['champ_radiographique']['resultat'],
+                        qc['champ_radiographique']['justification'],
                     )
-                    st.markdown(
-                        f"**Symétrie :** {qc['symetrie']['resultat']}  \n"
-                        f"{qc['symetrie']['justification']}"
+                    afficher_critere(
+                        "Symétrie",
+                        qc['symetrie']['resultat'],
+                        qc['symetrie']['justification'],
                     )
-                    st.markdown(
-                        f"**Inspiration :** {qc['inspiration']['resultat']}  \n"
-                        f"{qc['inspiration']['justification']}"
+                    afficher_critere(
+                        "Inspiration",
+                        qc['inspiration']['resultat'],
+                        qc['inspiration']['justification'],
                     )
                     st.markdown(f"**Conclusion QC globale :** {qc['conclusion_globale']}")
 
@@ -292,8 +366,7 @@ with col1:
                     )
 
                     st.markdown("### Diagnostic")
-                    st.markdown(f"**Classification :** {diag['conclusion']}")
-                    st.markdown(f"**Analyse sémiologique :** {diag['description_semiologique']}")
+                    afficher_classification(diag['conclusion'], diag['description_semiologique'])
 
                     if st.checkbox("Afficher les données techniques JSON", value=False):
                         st.json(data)
