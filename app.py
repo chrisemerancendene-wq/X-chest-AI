@@ -498,7 +498,7 @@ with col_gauche:
 
                     st.success("✅ Analyse terminée — 💾 Sauvegardée !")
 
-                              except Exception as e:
+                except Exception as e:
                     st.error(f"⚠️ Erreur lors de l'analyse : {e}")
 
 with col_droite:
