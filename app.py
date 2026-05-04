@@ -178,6 +178,12 @@ def dataframe_to_sav_bytes(df):
 def concordance(valeur_ia, valeur_radio):
     return "Oui" if str(valeur_ia).strip().lower() == str(valeur_radio).strip().lower() else "Non"
 
+
+def reinitialiser_analyse():
+    st.session_state.pop("last_analysis_data", None)
+    st.session_state.pop("last_analysis_image", None)
+    st.session_state["analysis_reset_counter"] = st.session_state.get("analysis_reset_counter", 0) + 1
+
 # ══════════════════════════════════════════════════════
 # PROMPT COMPLET ET PRÉCIS
 # ══════════════════════════════════════════════════════
@@ -326,10 +332,11 @@ col1, col2 = st.columns([1, 1.5])
 
 with col1:
     st.subheader("📝 Identification")
-    p_id = st.text_input("🏷️ Identifiant radio", placeholder="RAD_001")
-    p_age = st.number_input("🎂 Âge du patient", min_value=18, max_value=120, value=30)
-    p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"])
-    img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'])
+    reset_counter = st.session_state.get("analysis_reset_counter", 0)
+    p_id = st.text_input("🏷️ Identifiant radio", placeholder="RAD_001", key=f"p_id_{reset_counter}")
+    p_age = st.number_input("🎂 Âge du patient", min_value=18, max_value=120, value=30, key=f"p_age_{reset_counter}")
+    p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"], key=f"p_sexe_{reset_counter}")
+    img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'], key=f"img_file_{reset_counter}")
 
     last_analysis_time = st.session_state.get("last_analysis_time", 0)
     remaining_wait = int(COOLDOWN_SECONDS - (time.time() - last_analysis_time))
@@ -512,6 +519,10 @@ with col1:
 
         if st.checkbox("Afficher les données techniques JSON", value=False):
             st.json(data)
+
+        if st.button("🔄 Nouvelle analyse"):
+            reinitialiser_analyse()
+            st.rerun()
 
 with col2:
     st.subheader("📜 Historique des analyses")
