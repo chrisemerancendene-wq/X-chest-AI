@@ -1,4 +1,4 @@
- import streamlit as st
+import streamlit as st
 
 # PAGE CONFIG — DOIT ÊTRE EN PREMIER
 st.set_page_config(page_title="RadioIA — Jamot", layout="wide", page_icon="🫁")
