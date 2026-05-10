@@ -1,58 +1,250 @@
-import streamlit as st
-import google.generativeai as genai
-import pandas as pd
-from PIL import Image, ImageDraw
-import json
-import time
-import io
-import base64
-import html
-import tempfile
-import streamlit.components.v1 as components
-from supabase import create_client, Client
+ import streamlit as st
 
-try:
-    import pyreadstat
-except Exception:
-    pyreadstat = None
-
-# ══════════════════════════════════════════════════════
-# CONFIGURATION DE LA PAGE
-# st.set_page_config doit être la première commande Streamlit.
-# ══════════════════════════════════════════════════════
+# PAGE CONFIG — DOIT ÊTRE EN PREMIER
 st.set_page_config(page_title="RadioIA — Jamot", layout="wide", page_icon="🫁")
 
-# ══════════════════════════════════════════════════════
-# CONFIGURATION — SECRETS & IA
-# ══════════════════════════════════════════════════════
-supabase = None
-model = None
-COOLDOWN_SECONDS = 60
+import google.generativeai as genai
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+import json
+import io
+from datetime import datetime
+from supabase import create_client, Client
 
+# ══════════════════════════════════════════════════════
+# INITIALISATION GEMINI (CACHÉE)
+# ══════════════════════════════════════════════════════
+@st.cache_resource
+def initialiser_gemini(api_key):
+    genai.configure(api_key=api_key)
+    modeles_preferes = [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash",
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-pro",
+    ]
+    modeles_disponibles = []
+    for m in genai.list_models():
+        methodes = getattr(m, "supported_generation_methods", [])
+        if "generateContent" in methodes:
+            modeles_disponibles.append(m.name)
+    for nom in modeles_preferes:
+        if nom in modeles_disponibles:
+            return genai.GenerativeModel(model_name=nom), nom
+    if modeles_disponibles:
+        nom = modeles_disponibles[0]
+        return genai.GenerativeModel(model_name=nom), nom
+    raise RuntimeError("Aucun modèle compatible disponible.")
+
+# ══════════════════════════════════════════════════════
+# INITIALISATION SUPABASE (CACHÉE)
+# ══════════════════════════════════════════════════════
+@st.cache_resource
+def initialiser_supabase(url, key):
+    return create_client(url, key)
+
+# ══════════════════════════════════════════════════════
+# FONCTION POUR ANNOTER L'IMAGE
+# ══════════════════════════════════════════════════════
+def annoter_image(img, data):
+    img_annotee = img.copy()
+    draw = ImageDraw.Draw(img_annotee)
+    W, H = img_annotee.size
+    ep = max(3, int(min(W, H) / 200))
+
+    try:
+        taille_label = max(16, int(H / 32))
+        taille_petit = max(14, int(H / 40))
+        taille_bandeau = max(22, int(H / 18))
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", taille_label)
+        petite_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", taille_petit)
+        font_bandeau = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", taille_bandeau)
+    except:
+        font = ImageFont.load_default()
+        petite_font = font
+        font_bandeau = font
+
+    qc = data.get('qualite', {})
+    diag = data.get('diagnostic', {})
+    classification = diag.get('classification', 'INDÉTERMINÉ')
+
+    # 1. BANDEAU CLASSIFICATION
+    bandeau_h = max(40, int(H / 12))
+    if classification == "NORMAL":
+        couleur_b = (0, 140, 50)
+        texte_b = "NORMAL"
+    elif classification == "PATHOLOGIQUE":
+        couleur_b = (190, 20, 20)
+        texte_b = "PATHOLOGIQUE"
+    else:
+        couleur_b = (140, 140, 0)
+        texte_b = "INDÉTERMINÉ"
+    draw.rectangle([0, 0, W, bandeau_h], fill=couleur_b)
+    bbox_b = font_bandeau.getbbox(texte_b)
+    tw_b = bbox_b[2] - bbox_b[0]
+    draw.text(((W - tw_b) // 2, 8), texte_b, fill=(255, 255, 255), font=font_bandeau)
+
+    # 2. CHAMP RADIOGRAPHIQUE
+    bleu = (80, 160, 255)
+    res_champ = qc.get('champ_radiographique', {}).get('resultat', '')
+    couleur_champ = (0, 230, 0) if res_champ == "OUI" else (255, 80, 80)
+
+    apex_y1 = bandeau_h + 5
+    apex_y2 = int(H * 0.18)
+    draw.rectangle([10, apex_y1, W - 10, apex_y2], outline=couleur_champ, width=ep)
+    label_apex = "ZONE APEX PULMONAIRES"
+    if res_champ == "OUI":
+        label_apex += " ✓"
+    else:
+        label_apex += " ✗"
+    draw.rectangle([15, apex_y1 + 5, 320, apex_y1 + taille_label + 12], fill=(20, 40, 80))
+    draw.text((20, apex_y1 + 8), label_apex, fill=couleur_champ, font=petite_font)
+
+    cds_y1 = int(H * 0.82)
+    cds_y2 = int(H * 0.95)
+    draw.rectangle([10, cds_y1, W - 10, cds_y2], outline=couleur_champ, width=ep)
+    label_cds = "ZONE CULS-DE-SAC"
+    if res_champ == "OUI":
+        label_cds += " ✓"
+    else:
+        label_cds += " ✗"
+    draw.rectangle([15, cds_y1 + 5, 250, cds_y1 + taille_label + 12], fill=(20, 40, 80))
+    draw.text((20, cds_y1 + 8), label_cds, fill=couleur_champ, font=petite_font)
+
+    # 3. SYMÉTRIE
+    vert = (0, 230, 0)
+    jaune = (255, 220, 0)
+    res_sym = qc.get('symetrie', {}).get('resultat', '')
+
+    x_centre = W // 2
+    y_sym_start = int(H * 0.12)
+    y_sym_end = int(H * 0.35)
+
+    tiret = max(10, int(H / 50))
+    for y in range(y_sym_start, y_sym_end, tiret * 2):
+        draw.line([(x_centre, y), (x_centre, min(y + tiret, y_sym_end))], fill=vert, width=ep)
+
+    sym_zone_x1 = int(W * 0.25)
+    sym_zone_x2 = int(W * 0.75)
+    sym_zone_y1 = int(H * 0.10)
+    sym_zone_y2 = int(H * 0.22)
+    draw.rectangle([sym_zone_x1, sym_zone_y1, sym_zone_x2, sym_zone_y2], outline=jaune, width=ep)
+
+    draw.rectangle([sym_zone_x1, sym_zone_y1 - taille_label - 8, sym_zone_x1 + 200, sym_zone_y1 - 2], fill=(50, 50, 20))
+    draw.text((sym_zone_x1 + 5, sym_zone_y1 - taille_label - 5), "ZONE CLAVICULAIRE", fill=jaune, font=petite_font)
+
+    y_d = sym_zone_y2 + 15
+    draw.line([(sym_zone_x1, y_d), (x_centre, y_d)], fill=jaune, width=ep)
+    draw.line([(x_centre, y_d), (sym_zone_x2, y_d)], fill=jaune, width=ep)
+    draw.line([(sym_zone_x1, y_d - 6), (sym_zone_x1, y_d + 6)], fill=jaune, width=ep)
+    draw.line([(x_centre, y_d - 6), (x_centre, y_d + 6)], fill=vert, width=ep)
+    draw.line([(sym_zone_x2, y_d - 6), (sym_zone_x2, y_d + 6)], fill=jaune, width=ep)
+
+    draw.rectangle([(sym_zone_x1 + x_centre) // 2 - 20, y_d - 20, (sym_zone_x1 + x_centre) // 2 + 20, y_d - 5], fill=(50, 50, 20))
+    draw.text(((sym_zone_x1 + x_centre) // 2 - 12, y_d - 20), "D1", fill=jaune, font=petite_font)
+    draw.rectangle([(x_centre + sym_zone_x2) // 2 - 20, y_d - 20, (x_centre + sym_zone_x2) // 2 + 20, y_d - 5], fill=(50, 50, 20))
+    draw.text(((x_centre + sym_zone_x2) // 2 - 12, y_d - 20), "D2", fill=jaune, font=petite_font)
+
+    if res_sym == "OUI":
+        verdict = "D1 ≈ D2 (Symétrique) ✓"
+        couleur_v = vert
+    else:
+        verdict = "D1 ≠ D2 (Asymétrique) ✗"
+        couleur_v = (255, 80, 80)
+    bbox_v = font.getbbox(verdict)
+    tw_v = bbox_v[2] - bbox_v[0]
+    draw.rectangle([x_centre - tw_v // 2 - 10, y_d + 8, x_centre + tw_v // 2 + 10, y_d + taille_label + 15], fill=(30, 30, 40))
+    draw.text((x_centre - tw_v // 2, y_d + 10), verdict, fill=couleur_v, font=font)
+
+    # 4. INSPIRATION
+    cyan = (0, 220, 230)
+    res_insp = qc.get('inspiration', {}).get('resultat', '')
+    annotations = data.get('annotations', {})
+    nb_arcs = annotations.get('arcs_costaux', {}).get('nombre_visible', 0)
+
+    arc_zone_x1 = int(W * 0.75)
+    arc_zone_x2 = W - 10
+    arc_zone_y1 = int(H * 0.25)
+    arc_zone_y2 = int(H * 0.75)
+    draw.rectangle([arc_zone_x1, arc_zone_y1, arc_zone_x2, arc_zone_y2], outline=cyan, width=ep)
+
+    draw.rectangle([arc_zone_x1, arc_zone_y1 - taille_label - 8, arc_zone_x1 + 180, arc_zone_y1 - 2], fill=(20, 50, 50))
+    draw.text((arc_zone_x1 + 5, arc_zone_y1 - taille_label - 5), "ZONE ARCS COSTAUX", fill=cyan, font=petite_font)
+
+    if res_insp == "OUI":
+        bilan = f"{nb_arcs} arcs (>=7) ✓"
+        couleur_insp = vert
+    else:
+        bilan = f"{nb_arcs} arcs (<7) ✗"
+        couleur_insp = (255, 80, 80)
+
+    bbox_bilan = font.getbbox(bilan)
+    tw_bilan = bbox_bilan[2] - bbox_bilan[0]
+    y_bilan = arc_zone_y2 + 10
+    draw.rectangle([arc_zone_x1, y_bilan, arc_zone_x1 + tw_bilan + 20, y_bilan + taille_label + 10], fill=(30, 30, 40))
+    draw.text((arc_zone_x1 + 10, y_bilan + 5), bilan, fill=couleur_insp, font=font)
+
+    # 5. PATHOLOGIES
+    pathologies = annotations.get('pathologies', [])
+    if pathologies:
+        for patho in pathologies:
+            px = int(W * patho.get('x', 50) / 100)
+            py = int(H * patho.get('y', 50) / 100)
+            label = patho.get('label', 'Anomalie')
+            rayon = max(20, int(min(W, H) / 15))
+            rouge = (255, 40, 40)
+            draw.ellipse([px - rayon, py - rayon, px + rayon, py + rayon], outline=rouge, width=ep + 2)
+            draw.ellipse([px - rayon - 6, py - rayon - 6, px + rayon + 6, py + rayon + 6], outline=(255, 100, 100), width=ep)
+            lx = px + rayon + 20
+            ly = py - rayon - 15
+            draw.line([(px + rayon, py - rayon // 2), (lx, ly)], fill=rouge, width=ep + 1)
+            bbox_l = font.getbbox(label)
+            tw_l = bbox_l[2] - bbox_l[0]
+            th_l = bbox_l[3] - bbox_l[1]
+            draw.rectangle([lx - 5, ly - th_l - 10, lx + tw_l + 12, ly + 8], fill=(160, 0, 0))
+            draw.text((lx + 3, ly - th_l - 5), label, fill=(255, 255, 255), font=font)
+
+    # 6. LÉGENDE
+    legende_h = max(50, int(H / 12))
+    y_leg = H - legende_h
+    draw.rectangle([0, y_leg, W, H], fill=(15, 15, 25))
+
+    items = [
+        ((80, 160, 255), "Champ"),
+        ((0, 230, 0), "Médiane"),
+        ((255, 220, 0), "Symétrie"),
+        ((0, 220, 230), "Arcs"),
+        ((255, 40, 40), "Pathologie"),
+    ]
+    x_pos = 15
+    for couleur, texte in items:
+        draw.rectangle([x_pos, y_leg + 8, x_pos + 14, y_leg + 22], fill=couleur)
+        draw.text((x_pos + 18, y_leg + 6), texte, fill=(220, 220, 220), font=petite_font)
+        bbox_it = petite_font.getbbox(texte)
+        x_pos += (bbox_it[2] - bbox_it[0]) + 40
+
+    note = "Repères pédagogiques — Zones d'évaluation schématiques"
+    draw.text((15, y_leg + 28), note, fill=(150, 150, 150), font=petite_font)
+
+    return img_annotee
+
+# ══════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     GEMINI_KEY = st.secrets["GEMINI_KEY"]
 
-    # Connexion Supabase
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    
-    # Configuration Gemini
-    genai.configure(api_key=GEMINI_KEY)
-    
-    # On utilise un modèle Flash récent compatible avec generateContent.
-    generation_config = {
-        "temperature": 0,
-        "response_mime_type": "application/json",
-    }
-    MODEL_NAME = 'gemini-2.5-flash'
-    model = genai.GenerativeModel(model_name=MODEL_NAME, generation_config=generation_config)
+    supabase = initialiser_supabase(SUPABASE_URL, SUPABASE_KEY)
+    model, MODEL_NAME = initialiser_gemini(GEMINI_KEY)
 
 except Exception as e:
     st.error(f"Erreur de configuration (Vérifiez vos Secrets) : {e}")
+    st.stop()
 
 # ══════════════════════════════════════════════════════
-# DESIGN DARK MODE
+# DESIGN
 # ══════════════════════════════════════════════════════
 st.markdown("""
 <style>
@@ -64,589 +256,557 @@ st.markdown("""
     width: 100%;
 }
 .stButton>button:hover { opacity: 0.88; }
-.result-card {
-    background: #1a2235; border-radius: 12px;
-    padding: 1rem; margin-bottom: 0.75rem;
-    border: 1px solid #1a3050;
+.critere-oui {
+    background: linear-gradient(135deg, #0d3d0d, #1a5a1a);
+    border-radius: 10px; padding: 0.9rem; margin-bottom: 0.6rem;
+    border-left: 5px solid #00c853; color: #ffffff;
 }
+.critere-oui strong { color: #4ade80; }
+.critere-non {
+    background: linear-gradient(135deg, #3d0d0d, #5a1a1a);
+    border-radius: 10px; padding: 0.9rem; margin-bottom: 0.6rem;
+    border-left: 5px solid #ff1744; color: #ffffff;
+}
+.critere-non strong { color: #ff6b6b; }
+.qc-conforme {
+    background: linear-gradient(135deg, #0d3d0d, #1a5a1a);
+    border-radius: 10px; padding: 1rem; margin: 0.8rem 0;
+    border: 2px solid #00c853; text-align: center;
+    font-size: 1.2rem; font-weight: bold; color: #4ade80;
+}
+.qc-non-conforme {
+    background: linear-gradient(135deg, #3d0d0d, #5a1a1a);
+    border-radius: 10px; padding: 1rem; margin: 0.8rem 0;
+    border: 2px solid #ff1744; text-align: center;
+    font-size: 1.2rem; font-weight: bold; color: #ff6b6b;
+}
+.classif-normal {
+    background: linear-gradient(135deg, #0a4a0a, #15751a);
+    padding: 1rem; border-radius: 12px; text-align: center;
+    font-size: 1.4rem; font-weight: bold; color: #4ade80;
+    border: 3px solid #00c853; margin-bottom: 1rem;
+}
+.classif-patho {
+    background: linear-gradient(135deg, #4a0a0a, #751515);
+    padding: 1rem; border-radius: 12px; text-align: center;
+    font-size: 1.4rem; font-weight: bold; color: #ff6b6b;
+    border: 3px solid #ff1744; margin-bottom: 1rem;
+}
+.principe { color: #a0a0a0; font-size: 0.85rem; font-style: italic; margin-bottom: 0.3rem; }
+.justification { color: #e0e0e0; margin-top: 0.4rem; }
 </style>
 """, unsafe_allow_html=True)
 
-
-def afficher_critere(titre, resultat, justification):
-    resultat_clean = str(resultat).strip().upper()
-    is_ok = resultat_clean == "OUI"
-    color = "#22c55e" if is_ok else "#ef4444"
-    bg = "rgba(34, 197, 94, 0.14)" if is_ok else "rgba(239, 68, 68, 0.14)"
-    border = "rgba(34, 197, 94, 0.45)" if is_ok else "rgba(239, 68, 68, 0.45)"
-    st.markdown(
-        f"""
-        <div style="border-left: 4px solid {color}; background: {bg}; border: 1px solid {border}; padding: 0.85rem 1rem; border-radius: 10px; margin-bottom: 0.75rem;">
-            <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
-                <strong style="font-size: 1rem; color: #ffffff;">{html.escape(titre)}</strong>
-                <span style="background: {color}; color: white; padding: 0.2rem 0.65rem; border-radius: 999px; font-weight: 800;">{html.escape(resultat_clean)}</span>
-            </div>
-            <div style="margin-top: 0.45rem; color: #d7deea; line-height: 1.45;">{html.escape(str(justification))}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def afficher_classification(conclusion, description):
-    conclusion_clean = str(conclusion).strip()
-    is_normal = conclusion_clean.lower() == "normal"
-    color = "#22c55e" if is_normal else "#ef4444"
-    bg = "rgba(34, 197, 94, 0.14)" if is_normal else "rgba(239, 68, 68, 0.14)"
-    st.markdown(
-        f"""
-        <div style="background: {bg}; border: 1px solid {color}; border-radius: 12px; padding: 1rem; margin-bottom: 0.75rem;">
-            <div style="font-size: 1rem; color: #d7deea;">Classification</div>
-            <div style="font-size: 1.5rem; font-weight: 900; color: {color}; margin-top: 0.15rem;">{html.escape(conclusion_clean)}</div>
-            <div style="margin-top: 0.75rem; color: #ffffff; line-height: 1.5;">{html.escape(str(description))}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def afficher_conformite_globale(conclusion):
-    conclusion_clean = str(conclusion).strip()
-    is_ok = conclusion_clean.lower() == "conforme"
-    color = "#22c55e" if is_ok else "#ef4444"
-    bg = "rgba(34, 197, 94, 0.14)" if is_ok else "rgba(239, 68, 68, 0.14)"
-    st.markdown(
-        f"""
-        <div style="background: {bg}; border: 1px solid {color}; border-radius: 10px; padding: 0.9rem 1rem; margin: 0.75rem 0 1rem 0;">
-            <div style="font-size: 0.95rem; color: #d7deea;">Conclusion QC globale</div>
-            <div style="font-size: 1.35rem; font-weight: 900; color: {color}; margin-top: 0.15rem;">{html.escape(conclusion_clean)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def afficher_image_zoomable(image, caption="Radiographie annotée"):
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    components.html(
-        f"""
-        <div style="font-family: sans-serif; color: white; background: #0E1117; padding: 0;">
-            <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.6rem;">
-                <strong>{html.escape(caption)}</strong>
-                <label style="font-size: 0.9rem; color: #cbd5e1;">Zoom : <span id="zoomValue">140%</span></label>
-            </div>
-            <input id="zoomSlider" type="range" min="80" max="300" value="140" step="10" style="width: 100%; margin-bottom: 0.75rem;">
-            <div style="height: 620px; overflow: auto; border: 1px solid #1a3050; border-radius: 12px; background: #05070c;">
-                <img id="radioImage" src="data:image/png;base64,{encoded}" style="width: 140%; max-width: none; display: block;">
-            </div>
-            <script>
-                const slider = document.getElementById('zoomSlider');
-                const image = document.getElementById('radioImage');
-                const value = document.getElementById('zoomValue');
-                slider.addEventListener('input', function() {{
-                    image.style.width = slider.value + '%';
-                    value.textContent = slider.value + '%';
-                }});
-            </script>
-        </div>
-        """,
-        height=710,
-    )
-
-
-def dataframe_to_excel_bytes(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="analyses")
-    return output.getvalue()
-
-
-def dataframe_to_sav_bytes(df):
-    if pyreadstat is None:
-        return None
-    clean_df = df.copy()
-    for column in clean_df.columns:
-        clean_df[column] = clean_df[column].astype(str)
-    with tempfile.NamedTemporaryFile(suffix=".sav", delete=True) as temp_file:
-        pyreadstat.write_sav(clean_df, temp_file.name)
-        temp_file.seek(0)
-        return temp_file.read()
-
-
-def concordance(valeur_ia, valeur_radio):
-    return "Oui" if str(valeur_ia).strip().lower() == str(valeur_radio).strip().lower() else "Non"
-
-
-def reinitialiser_analyse():
-    st.session_state.pop("last_analysis_data", None)
-    st.session_state.pop("last_analysis_image", None)
-    st.session_state["analysis_reset_counter"] = st.session_state.get("analysis_reset_counter", 0) + 1
-
 # ══════════════════════════════════════════════════════
-# PROMPT COMPLET ET PRÉCIS
+# PROMPT STRICT
 # ══════════════════════════════════════════════════════
-PROMPT = """Tu es un radiologue expert en contrôle qualité de radiographies thoraciques.
-Ta priorité est d'abord le contrôle qualité du cliché, puis seulement le diagnostic.
+PROMPT = """Tu es un radiologue EXPERT en contrôle qualité des radiographies thoraciques.
 Analyse cette radiographie thoracique de face (PA).
-Réponds UNIQUEMENT en JSON strict, sans markdown, sans backticks, sans texte supplémentaire :
+
+Réponds UNIQUEMENT en JSON strict, sans markdown, sans backticks :
 
 {
   "qualite": {
-    "champ_radiographique": {"resultat": "OUI", "justification": "..."},
-    "symetrie": {"resultat": "OUI", "justification": "..."},
-    "inspiration": {"resultat": "OUI", "justification": "..."},
+    "champ_radiographique": {"resultat": "OUI ou NON", "justification": "..."},
+    "symetrie": {"resultat": "OUI ou NON", "justification": "..."},
+    "inspiration": {"resultat": "OUI ou NON", "justification": "..."},
     "conclusion_globale": "Conforme ou Non conforme"
   },
   "diagnostic": {
-    "conclusion": "Normal ou Pathologique",
-    "description_semiologique": "Explication en 2 à 3 phrases des signes radiologiques observés."
+    "classification": "NORMAL ou PATHOLOGIQUE",
+    "conclusion": "Diagnostic principal en une phrase",
+    "description_semiologique": "Description détaillée en 2 à 4 phrases."
+  },
+  "annotations": {
+    "arcs_costaux": {"nombre_visible": 8},
+    "pathologies": []
   }
 }
 
-Critères d'évaluation :
-- Champ radiographique : réponds "OUI" uniquement si les deux apex pulmonaires ET les deux culs de sac costo-diaphragmatiques sont entièrement visibles. Réponds "NON" si un apex est coupé, si un apex est partiellement hors champ, si un cul de sac costo-diaphragmatique est coupé, si la base pulmonaire est tronquée, ou si tu as un doute.
-- Symétrie : les bords internes des clavicules sont-ils équidistants des apophyses épineuses ?
-- Inspiration : au moins 7 à 9 arcs costaux postérieurs sont-ils visibles ?
-- Conclusion QC globale : réponds exactement "Conforme" si et seulement si champ_radiographique, symetrie et inspiration sont tous les trois à "OUI". Si au moins un seul critère est à "NON", réponds exactement "Non conforme".
-- Diagnostic : la conclusion doit être exactement "Normal" ou "Pathologique".
+════════════════════════════════════════════════════════
+CRITÈRE 1 : CHAMP RADIOGRAPHIQUE
+════════════════════════════════════════════════════════
 
-Règles strictes pour le champ radiographique :
-- Si le bord supérieur de l'image coupe les sommets pulmonaires, champ_radiographique = "NON".
-- Si le bord inférieur ou latéral de l'image coupe un angle costo-diaphragmatique, champ_radiographique = "NON".
-- Si les apex ou les culs de sac ne sont pas visibles clairement, champ_radiographique = "NON".
-- Ne déduis pas qu'un élément est visible s'il est hors champ. Ne sois pas permissif.
-- Dans la justification du champ, cite explicitement les apex et les culs de sac costo-diaphragmatiques."""
+DÉFINITION : Le champ radiographique évalue si l'IMAGE est correctement CADRÉE.
+C'est un critère TECHNIQUE (qualité du cliché), PAS un critère pathologique.
 
+MÉTHODE D'ÉVALUATION — Regarde les BORDS EXTRÊMES de l'image :
 
-def dessiner_reperes_visuels(image, data, params=None):
-    annotated = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(annotated)
-    width, height = annotated.size
-    line_width = max(3, width // 180)
-    qc = data.get("qualite", {})
-    params = params or {}
+Pour les APEX (haut) :
+- Regarde le BORD SUPÉRIEUR de l'image.
+- Les sommets des deux poumons doivent être ENTIÈREMENT INCLUS dans l'image.
+- "COUPÉ" signifie que le BORD DE L'IMAGE tranche/coupe le tissu pulmonaire.
+- Si le tissu pulmonaire continue jusqu'au bord de l'image et semble tronqué → NON.
+- Si tu vois de l'espace (noir ou tissu mou) au-dessus des apex → les apex sont inclus → OUI.
 
-    def px(value):
-        return int(float(value) * width / 1000)
+Pour les CULS-DE-SAC COSTO-DIAPHRAGMATIQUES (bas) :
+- Regarde le BORD INFÉRIEUR de l'image.
+- Les angles formés entre le diaphragme et la paroi costale doivent être INCLUS dans l'image.
+- "COUPÉ" signifie que le BORD DE L'IMAGE coupe cette zone.
 
-    def py(value):
-        return int(float(value) * height / 1000)
+DISTINCTION CRUCIALE — Ne PAS confondre :
+- COUPÉ par le bord de l'image (= problème TECHNIQUE de cadrage) → champ = NON
+- EFFACÉ ou COMBLÉ par une pathologie comme un épanchement pleural (= problème MÉDICAL) → champ = OUI (l'image est bien cadrée, c'est la maladie qui masque la structure)
 
-    def resultat(critere):
-        valeur = qc.get(critere, {}).get("resultat", "")
-        return str(valeur).upper() if valeur else "?"
+EXEMPLES :
+- Un cul-de-sac est COMBLÉ par un épanchement pleural mais la zone est dans l'image → champ = OUI (pathologie à signaler dans le diagnostic)
+- Un cul-de-sac est COUPÉ car le bord inférieur de l'image s'arrête trop haut → champ = NON
+- Un apex est OPACIFIÉ par une lésion mais visible dans l'image → champ = OUI
+- Un apex est TRONQUÉ car le bord supérieur de l'image coupe le sommet du poumon → champ = NON
 
-    # Les repères de qualité sont dessinés avec des proportions anatomiques
-    # simples pour éviter les coordonnées trop variables renvoyées par l'IA.
-    field_color = (190, 120, 255)
-    field_left = px(params.get("field_left", 80))
-    field_right = px(params.get("field_right", 920))
-    top_y = py(params.get("field_top", 80))
-    bottom_y = py(params.get("field_bottom", 920))
-    draw.rectangle((field_left, top_y, field_right, bottom_y), outline=field_color, width=line_width)
-    draw.text((field_left + 8, top_y + 8), f"Champ radiographique: {resultat('champ_radiographique')}", fill=field_color)
-    draw.text((field_left + 8, top_y + py(40)), "apex visibles", fill=field_color)
-    draw.text((field_left + 8, bottom_y - py(50)), "culs-de-sac costo-diaphragmatiques", fill=field_color)
+EN RÉSUMÉ : Champ = "Est-ce que l'image CONTIENT toute la zone thoracique ?"
+- OUI = toute la cage thoracique est dans le cadre de l'image (même si des structures sont masquées par une maladie)
+- NON = le cadrage de l'image est trop serré et coupe des zones anatomiques
 
-    mid_x = px(params.get("axis_x", 500))
-    draw.line((mid_x, top_y, mid_x, bottom_y), fill=(0, 180, 255), width=line_width)
-    draw.text((mid_x + 10, top_y), f"Symetrie: {resultat('symetrie')}", fill=(0, 180, 255))
-    draw.text((mid_x + 10, top_y + py(40)), "axe epineux median", fill=(0, 180, 255))
+════════════════════════════════════════════════════════
+CRITÈRE 2 : SYMÉTRIE
+════════════════════════════════════════════════════════
 
-    clav_y = params.get("clavicle_y", 230)
-    clav_width = params.get("clavicle_width", 190)
-    clav_gap = params.get("clavicle_gap", 35)
-    clav_slope = params.get("clavicle_slope", 55)
-    left_clavicle = (px(params.get("axis_x", 500) - clav_width), py(clav_y), px(params.get("axis_x", 500) - clav_gap), py(clav_y + clav_slope))
-    right_clavicle = (px(params.get("axis_x", 500) + clav_width), py(clav_y), px(params.get("axis_x", 500) + clav_gap), py(clav_y + clav_slope))
-    draw.line(left_clavicle, fill=(255, 210, 0), width=line_width)
-    draw.line(right_clavicle, fill=(255, 210, 0), width=line_width)
-    draw.line((left_clavicle[2], left_clavicle[3], mid_x, left_clavicle[3]), fill=(255, 210, 0), width=max(1, line_width // 2))
-    draw.line((right_clavicle[2], right_clavicle[3], mid_x, right_clavicle[3]), fill=(255, 210, 0), width=max(1, line_width // 2))
-    draw.text((px(params.get("axis_x", 500) - 250), py(clav_y - 50)), "clavicules equidistantes de l'axe", fill=(255, 210, 0))
+Évalue si le patient était bien CENTRÉ lors de la prise du cliché.
+- Les bords INTERNES (médiaux) des deux clavicules doivent être à ÉGALE DISTANCE de la ligne des apophyses épineuses.
+- Si une clavicule est nettement plus proche de la ligne médiane → rotation du patient → NON.
+- Si les distances sont approximativement égales → OUI.
 
-    rib_color = (0, 255, 120)
-    rib_count = int(params.get("rib_count", 7))
-    rib_top = params.get("rib_top", 350)
-    rib_spacing = params.get("rib_spacing", 75)
-    rib_width = params.get("rib_width", 190)
-    rib_height = params.get("rib_height", 300)
-    for side in (params.get("left_rib_center", 330), params.get("right_rib_center", 670)):
-        for i in range(rib_count):
-            y = rib_top + i * rib_spacing
-            bbox = (
-                px(side - rib_width),
-                py(y - 120),
-                px(side + rib_width),
-                py(y - 120 + rib_height),
-            )
-            draw.arc(bbox, start=205, end=335, fill=rib_color, width=line_width)
-            if side < 500:
-                draw.text((px(side - rib_width - 35), py(y + 20)), str(i + 1), fill=rib_color)
-    draw.text((px(80), py(620)), f"Inspiration: {resultat('inspiration')} - {rib_count} arcs posterieurs", fill=rib_color)
+════════════════════════════════════════════════════════
+CRITÈRE 3 : INSPIRATION
+════════════════════════════════════════════════════════
 
-    def point(coord):
-        x = max(0, min(1000, float(coord[0])))
-        y = max(0, min(1000, float(coord[1])))
-        return int(x * width / 1000), int(y * height / 1000)
+Évalue la profondeur de l'inspiration du patient.
+- Compte les arcs costaux POSTÉRIEURS visibles AU-DESSUS du diaphragme, du côté DROIT.
+- Bonne inspiration = 7 à 9 arcs → OUI.
+- Moins de 7 arcs → inspiration insuffisante → NON.
+- Indique le nombre exact dans la justification et dans annotations.arcs_costaux.nombre_visible.
 
-    def arrow(start, end, color):
-        x1, y1 = point(start)
-        x2, y2 = point(end)
-        draw.line((x1, y1, x2, y2), fill=color, width=line_width)
-        dx, dy = x2 - x1, y2 - y1
-        length = max((dx * dx + dy * dy) ** 0.5, 1)
-        ux, uy = dx / length, dy / length
-        size = line_width * 5
-        left = (x2 - ux * size - uy * size * 0.6, y2 - uy * size + ux * size * 0.6)
-        right = (x2 - ux * size + uy * size * 0.6, y2 - uy * size - ux * size * 0.6)
-        draw.polygon([(x2, y2), left, right], fill=color)
+════════════════════════════════════════════════════════
+CRITÈRE 4 : CLASSIFICATION DIAGNOSTIQUE
+════════════════════════════════════════════════════════
 
-    diagnostic = data.get("diagnostic", {})
-    conclusion = str(diagnostic.get("conclusion", "")).lower()
+- "NORMAL" = transparence pulmonaire normale, silhouette cardiaque normale, médiastin normal, pas d'anomalie osseuse.
+- "PATHOLOGIQUE" = toute anomalie observée (opacité, épanchement, cardiomégalie, condensation, nodule, fracture, etc.)
+- Si un cul-de-sac est COMBLÉ par un épanchement → classification = PATHOLOGIQUE (pas un problème de champ).
 
-    if not params.get("show_pathology_arrow", False) or "path" not in conclusion:
-        return annotated
-
-    arrow(
-        [params.get("arrow_start_x", 850), params.get("arrow_start_y", 250)],
-        [params.get("arrow_end_x", 650), params.get("arrow_end_y", 430)],
-        (255, 40, 40),
-    )
-    draw.text((px(params.get("arrow_start_x", 850)) + 8, py(params.get("arrow_start_y", 250)) + 8), "zone suspecte", fill=(255, 40, 40))
-    return annotated
+════════════════════════════════════════════════════════
+RÈGLE FINALE
+════════════════════════════════════════════════════════
+conclusion_globale = "Conforme" UNIQUEMENT si les 3 critères de qualité sont TOUS "OUI". Sinon "Non conforme"."""
 
 # ══════════════════════════════════════════════════════
-# TITRE
+# NAVIGATION
 # ══════════════════════════════════════════════════════
-st.markdown("# 🫁 RadioIA — Assistant Radiographie Thoracique")
-st.markdown("*Mémoire de Master en Radiologie et Imagerie Médicale — Hôpital Jamot de Yaoundé*")
-st.divider()
+st.sidebar.title("🫁 RadioIA")
+page = st.sidebar.radio("Navigation", [
+    "🩻 Analyse IA",
+    "👨‍⚕️ Validation Radiologue",
+    "📊 Export & Statistiques"
+], key="nav_main")
 
 # ══════════════════════════════════════════════════════
-# LAYOUT PRINCIPAL
+# PAGE 1 : ANALYSE IA
 # ══════════════════════════════════════════════════════
-col1, col2 = st.columns([1, 1.5])
+if page == "🩻 Analyse IA":
+    st.markdown("# 🫁 RadioIA — Assistant Radiographie Thoracique")
+    st.markdown("*Mémoire de Master en Radiologie et Imagerie Médicale — Hôpital Jamot de Yaoundé*")
+    st.divider()
 
-with col1:
-    st.subheader("📝 Identification")
-    reset_counter = st.session_state.get("analysis_reset_counter", 0)
-    p_id = st.text_input("🏷️ Identifiant radio", placeholder="RAD_001", key=f"p_id_{reset_counter}")
-    p_age = st.number_input("🎂 Âge du patient", min_value=18, max_value=120, value=30, key=f"p_age_{reset_counter}")
-    p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"], key=f"p_sexe_{reset_counter}")
-    img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'], key=f"img_file_{reset_counter}")
+    col_gauche, col_droite = st.columns([1, 1.5])
 
-    last_analysis_time = st.session_state.get("last_analysis_time", 0)
-    remaining_wait = int(COOLDOWN_SECONDS - (time.time() - last_analysis_time))
-    remaining_wait = max(0, remaining_wait)
+    with col_gauche:
+        st.subheader("📝 Nouvelle analyse")
+        
+        # Upload HORS du formulaire
+        img_file = st.file_uploader("🩻 Uploader la radiographie", type=['jpg', 'jpeg', 'png'], key="uploader_radio")
 
-    repere_params = {
-        "field_left": 80, "field_right": 920, "field_top": 80, "field_bottom": 920,
-        "axis_x": 500, "clavicle_y": 230, "clavicle_width": 190, "clavicle_gap": 35,
-        "clavicle_slope": 55, "rib_count": 7, "rib_top": 350, "rib_spacing": 75,
-        "rib_width": 190, "rib_height": 300, "left_rib_center": 330, "right_rib_center": 670,
-        "show_pathology_arrow": False, "arrow_start_x": 850, "arrow_start_y": 250,
-        "arrow_end_x": 650, "arrow_end_y": 430,
-    }
-
-    if img_file:
-        img_file.seek(0)
-        img_preview = Image.open(img_file)
-        st.image(img_preview, caption=f"Radio chargée — {p_id}", use_container_width=True)
-
-        with st.expander("🎯 Réglage précis des repères visuels", expanded=False):
-            st.caption("Ajustez les repères avant ou après l'analyse. Les valeurs sont normalisées de 0 à 1000.")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                repere_params["field_left"] = st.slider("Champ - limite gauche", 0, 400, 80, 5)
-                repere_params["field_top"] = st.slider("Champ - limite haute", 0, 300, 80, 5)
-                repere_params["axis_x"] = st.slider("Axe médian", 350, 650, 500, 5)
-                repere_params["clavicle_y"] = st.slider("Hauteur des clavicules", 100, 400, 230, 5)
-                repere_params["rib_top"] = st.slider("Début des arcs costaux", 200, 550, 350, 5)
-                repere_params["rib_count"] = st.slider("Nombre d'arcs affichés", 5, 9, 7, 1)
-            with col_b:
-                repere_params["field_right"] = st.slider("Champ - limite droite", 600, 1000, 920, 5)
-                repere_params["field_bottom"] = st.slider("Champ - limite basse", 650, 1000, 920, 5)
-                repere_params["clavicle_width"] = st.slider("Longueur visuelle des clavicules", 80, 300, 190, 5)
-                repere_params["clavicle_slope"] = st.slider("Inclinaison des clavicules", 0, 120, 55, 5)
-                repere_params["rib_spacing"] = st.slider("Espacement des arcs", 35, 110, 75, 5)
-                repere_params["rib_width"] = st.slider("Largeur des arcs", 80, 280, 190, 5)
-
-            repere_params["show_pathology_arrow"] = st.checkbox("Afficher une flèche rouge de pathologie", value=False)
-            if repere_params["show_pathology_arrow"]:
-                col_c, col_d = st.columns(2)
-                with col_c:
-                    repere_params["arrow_start_x"] = st.slider("Flèche - départ X", 0, 1000, 850, 5)
-                    repere_params["arrow_start_y"] = st.slider("Flèche - départ Y", 0, 1000, 250, 5)
-                with col_d:
-                    repere_params["arrow_end_x"] = st.slider("Flèche - pointe X", 0, 1000, 650, 5)
-                    repere_params["arrow_end_y"] = st.slider("Flèche - pointe Y", 0, 1000, 430, 5)
-
-            st.image(
-                dessiner_reperes_visuels(img_preview, {}, repere_params),
-                caption="Aperçu des repères réglables",
-                use_container_width=True,
-            )
-
-    if remaining_wait > 0:
-        st.info(f"⏳ Patientez encore {remaining_wait} seconde(s) avant une nouvelle analyse.")
-
-    if st.button("🚀 ANALYSER ET SAUVEGARDER", disabled=remaining_wait > 0):
-        if model is None or supabase is None:
-            st.error("⚠️ Configuration incomplète : vérifiez vos Secrets Streamlit.")
-        elif not img_file:
-            st.warning("⚠️ Veuillez uploader une radiographie.")
-        elif not p_id:
-            st.warning("⚠️ Veuillez renseigner l'identifiant radio.")
-        else:
+        if img_file is not None:
             img_file.seek(0)
-            img = Image.open(img_file)
-            with st.spinner("🔬 Analyse en cours..."):
-                try:
-                    st.session_state["last_analysis_time"] = time.time()
-                    response = model.generate_content([PROMPT, img])
-                    
-                    # Nettoyage du JSON au cas où l'IA ajoute des balises.
-                    clean_text = response.text.replace('```json', '').replace('```', '').strip()
-                    data = json.loads(clean_text)
+            st.session_state['image_bytes'] = img_file.read()
+            st.session_state['image_name'] = img_file.name
+        
+        if 'image_bytes' in st.session_state:
+            img_preview = Image.open(io.BytesIO(st.session_state['image_bytes'])).convert("RGB")
+            st.image(img_preview, caption="Radio chargée", use_container_width=True)
 
-                    # Extraction
-                    qc = data['qualite']
-                    diag = data['diagnostic']
-                    conclusion = str(diag.get('conclusion', '')).strip()
-                    if 'path' in conclusion.lower():
-                        diag['conclusion'] = 'Pathologique'
-                    elif 'normal' in conclusion.lower() or 'normale' in conclusion.lower():
-                        diag['conclusion'] = 'Normal'
+        # Formulaire
+        with st.form("formulaire_analyse", clear_on_submit=False):
+            p_id = st.text_input("🏷️ Identifiant radio", placeholder="RAD_001")
+            p_age = st.number_input("🎂 Âge du patient", min_value=18, max_value=120, value=30)
+            p_sexe = st.selectbox("👤 Sexe", ["Masculin", "Féminin"])
+            submitted = st.form_submit_button("🚀 ANALYSER ET SAUVEGARDER")
 
-                    criteres_qc = [
-                        str(qc['champ_radiographique']['resultat']).strip().upper(),
-                        str(qc['symetrie']['resultat']).strip().upper(),
-                        str(qc['inspiration']['resultat']).strip().upper(),
-                    ]
-                    qc['conclusion_globale'] = "Conforme" if all(c == "OUI" for c in criteres_qc) else "Non conforme"
-
-                    row_data = {
-                        "patient_id": p_id,
-                        "age": p_age,
-                        "sexe": p_sexe,
-                        "champ_radiographique": qc['champ_radiographique']['resultat'],
-                        "champ_justification": qc['champ_radiographique']['justification'],
-                        "symetrie": qc['symetrie']['resultat'],
-                        "symetrie_justification": qc['symetrie']['justification'],
-                        "inspiration": qc['inspiration']['resultat'],
-                        "inspiration_justification": qc['inspiration']['justification'],
-                        "conclusion_qc": qc['conclusion_globale'],
-                        "conclusion_qc_radiologue": "En attente",
-                        "diagnostic": diag['conclusion'],
-                        "description": diag['description_semiologique']
-                    }
-
-                    image_buffer = io.BytesIO()
-                    img.save(image_buffer, format="PNG")
-                    st.session_state["last_analysis_data"] = data
-                    st.session_state["last_analysis_image"] = image_buffer.getvalue()
-
-                    if "recent_analyses" not in st.session_state:
-                        st.session_state["recent_analyses"] = []
-                    st.session_state["recent_analyses"].insert(0, row_data)
-                    st.session_state["recent_analyses"] = st.session_state["recent_analyses"][:10]
-
-                    st.success(f"✅ Analyse terminée pour {p_id}")
-
-                    # Sauvegarde Supabase
+        if submitted:
+            if 'image_bytes' not in st.session_state:
+                st.warning("⚠️ Veuillez uploader une radiographie.")
+            elif not p_id:
+                st.warning("⚠️ Veuillez renseigner l'identifiant radio.")
+            else:
+                img = Image.open(io.BytesIO(st.session_state['image_bytes'])).convert("RGB")
+                with st.spinner("🔬 Analyse IA en cours..."):
                     try:
-                        supabase.table("analyses").insert(row_data).execute()
-                        st.success("💾 Données sauvegardées avec succès !")
-                    except Exception as save_error:
-                        st.warning(f"Analyse affichée, mais sauvegarde Supabase non effectuée : {save_error}")
+                        response = model.generate_content([PROMPT, img])
+                        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+                        debut = clean_text.find("{")
+                        fin = clean_text.rfind("}")
+                        if debut != -1 and fin != -1:
+                            clean_text = clean_text[debut:fin + 1]
+                        data = json.loads(clean_text)
 
-                except json.JSONDecodeError as e:
-                    st.error(f"⚠️ L'IA n'a pas renvoyé un JSON valide : {e}")
-                    if 'response' in locals():
-                        st.code(response.text, language="text")
-                except KeyError as e:
-                    st.error(f"⚠️ Clé manquante dans la réponse JSON : {e}")
-                    if 'data' in locals():
-                        st.json(data)
-                except Exception as e:
-                    if "429" in str(e) or "quota" in str(e).lower():
-                        st.error("⚠️ Quota Gemini temporairement dépassé. Patientez environ 1 minute, puis réessayez.")
-                        st.info("Cette limite peut aussi être atteinte si la même clé API est utilisée ailleurs ou si plusieurs essais ont été faits récemment.")
-                    else:
+                        qc = data['qualite']
+                        diag = data['diagnostic']
+                        classification = diag.get('classification', 'INDÉTERMINÉ')
+
+                        res_champ = qc['champ_radiographique']['resultat'].upper().strip()
+                        res_sym = qc['symetrie']['resultat'].upper().strip()
+                        res_insp = qc['inspiration']['resultat'].upper().strip()
+
+                        if res_champ == "OUI" and res_sym == "OUI" and res_insp == "OUI":
+                            qc['conclusion_globale'] = "Conforme"
+                        else:
+                            qc['conclusion_globale'] = "Non conforme"
+
+                        img_annotee = annoter_image(img, data)
+
+                        st.session_state['derniere_analyse'] = {
+                            'img_annotee': img_annotee,
+                            'data': data,
+                            'patient_id': p_id
+                        }
+
+                        supabase.table("analyses").insert({
+                            "patient_id": p_id,
+                            "age": p_age,
+                            "sexe": p_sexe,
+                            "champ_radiographique": qc['champ_radiographique']['resultat'],
+                            "champ_justification": qc['champ_radiographique']['justification'],
+                            "symetrie": qc['symetrie']['resultat'],
+                            "symetrie_justification": qc['symetrie']['justification'],
+                            "inspiration": qc['inspiration']['resultat'],
+                            "inspiration_justification": qc['inspiration']['justification'],
+                            "conclusion_qc": qc['conclusion_globale'],
+                            "diagnostic": diag['conclusion'],
+                            "classification": classification,
+                            "description": diag['description_semiologique']
+                        }).execute()
+
+                        st.success("✅ Analyse terminée — 💾 Sauvegardée !")
+
+                    except Exception as e:
                         st.error(f"⚠️ Erreur lors de l'analyse : {e}")
 
-    if "last_analysis_data" in st.session_state and "last_analysis_image" in st.session_state:
-        data = st.session_state["last_analysis_data"]
-        qc = data["qualite"]
-        diag = data["diagnostic"]
-        img_result = Image.open(io.BytesIO(st.session_state["last_analysis_image"]))
+        # Bouton Nouvelle Analyse
+        if 'derniere_analyse' in st.session_state:
+            st.markdown("")
+            if st.button("🔄 NOUVELLE ANALYSE", key="btn_nouvelle"):
+                if 'derniere_analyse' in st.session_state:
+                    del st.session_state['derniere_analyse']
+                if 'image_bytes' in st.session_state:
+                    del st.session_state['image_bytes']
+                if 'image_name' in st.session_state:
+                    del st.session_state['image_name']
+                st.rerun()
 
-        st.markdown("### Résultat de l'analyse")
-        img_annotee = dessiner_reperes_visuels(img_result, data, repere_params)
-        afficher_image_zoomable(img_annotee, caption="Radiographie annotée avec repères visuels")
+    with col_droite:
+        if 'derniere_analyse' in st.session_state:
+            analyse = st.session_state['derniere_analyse']
+            data = analyse['data']
+            qc = data['qualite']
+            diag = data['diagnostic']
+            classification = diag.get('classification', 'INDÉTERMINÉ')
 
-        st.markdown("### Résultats qualité")
-        afficher_critere(
-            "Champ radiographique",
-            qc['champ_radiographique']['resultat'],
-            qc['champ_radiographique']['justification'],
-        )
-        afficher_critere(
-            "Symétrie",
-            qc['symetrie']['resultat'],
-            qc['symetrie']['justification'],
-        )
-        afficher_critere(
-            "Inspiration",
-            qc['inspiration']['resultat'],
-            qc['inspiration']['justification'],
-        )
-        afficher_conformite_globale(qc['conclusion_globale'])
+            st.subheader(f"🔍 Résultat — {analyse['patient_id']}")
 
-        st.markdown("### Lecture des repères visuels")
-        st.markdown(
-            "- **Violet :** vérifie que le champ inclut les apex et les culs-de-sac costo-diaphragmatiques.\n"
-            "- **Bleu/jaune :** compare l'axe médian aux clavicules pour juger la rotation et la symétrie.\n"
-            "- **Vert :** matérialise le comptage des arcs costaux postérieurs pour l'inspiration.\n"
-            "- **Rouge :** flèche manuelle à activer seulement si vous voulez marquer une zone suspecte."
-        )
+            st.image(analyse['img_annotee'], use_container_width=True)
 
-        st.markdown("### Diagnostic")
-        afficher_classification(diag['conclusion'], diag['description_semiologique'])
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                with st.expander("🔎 ZOOM"):
+                    st.image(analyse['img_annotee'], use_container_width=True)
 
-        if st.checkbox("Afficher les données techniques JSON", value=False):
-            st.json(data)
+            with col_btn2:
+                img_bytes = io.BytesIO()
+                analyse['img_annotee'].save(img_bytes, format='PNG')
+                img_bytes.seek(0)
+                st.download_button(
+                    label="💾 Télécharger",
+                    data=img_bytes,
+                    file_name=f"radio_{analyse['patient_id']}.png",
+                    mime="image/png"
+                )
 
-        if st.button("🔄 Nouvelle analyse"):
-            reinitialiser_analyse()
-            st.rerun()
+            if classification == "NORMAL":
+                st.markdown('<div class="classif-normal">✅ CLASSIFICATION : NORMAL</div>', unsafe_allow_html=True)
+            elif classification == "PATHOLOGIQUE":
+                st.markdown('<div class="classif-patho">⚠️ CLASSIFICATION : PATHOLOGIQUE</div>', unsafe_allow_html=True)
 
-with col2:
-    st.subheader("📜 Historique des analyses")
-    history_rows = []
-    try:
-        if supabase is None:
-            st.info("En attente de configuration Supabase...")
-        else:
-            history = supabase.table("analyses").select("*").order('created_at', desc=True).limit(1000).execute()
-            if history.data:
-                history_rows = history.data
-                for row in history.data[:10]:
-                    with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
-                        st.write(f"**Description :** {row['description']}")
+            st.markdown("### 📋 Critères de qualité")
+
+            res_champ = qc['champ_radiographique']['resultat']
+            classe_champ = "critere-oui" if res_champ == "OUI" else "critere-non"
+            icone_champ = "✅" if res_champ == "OUI" else "❌"
+            st.markdown(f"""<div class="{classe_champ}">
+                <strong>{icone_champ} CHAMP RADIOGRAPHIQUE : {res_champ}</strong>
+                <div class="principe">Principe : apex pulmonaires et culs-de-sac entièrement visibles.</div>
+                <div class="justification">→ {qc['champ_radiographique']['justification']}</div>
+            </div>""", unsafe_allow_html=True)
+
+            res_sym = qc['symetrie']['resultat']
+            classe_sym = "critere-oui" if res_sym == "OUI" else "critere-non"
+            icone_sym = "✅" if res_sym == "OUI" else "❌"
+            st.markdown(f"""<div class="{classe_sym}">
+                <strong>{icone_sym} SYMÉTRIE : {res_sym}</strong>
+                <div class="principe">Principe : bords internes des clavicules équidistants des épineuses.</div>
+                <div class="justification">→ {qc['symetrie']['justification']}</div>
+            </div>""", unsafe_allow_html=True)
+
+            res_insp = qc['inspiration']['resultat']
+            classe_insp = "critere-oui" if res_insp == "OUI" else "critere-non"
+            icone_insp = "✅" if res_insp == "OUI" else "❌"
+            st.markdown(f"""<div class="{classe_insp}">
+                <strong>{icone_insp} INSPIRATION : {res_insp}</strong>
+                <div class="principe">Principe : au moins 7 arcs costaux postérieurs visibles.</div>
+                <div class="justification">→ {qc['inspiration']['justification']}</div>
+            </div>""", unsafe_allow_html=True)
+
+            concl_qc = qc['conclusion_globale']
+            if concl_qc == "Conforme":
+                st.markdown('<div class="qc-conforme">✅ CONFORMITÉ GLOBALE : CONFORME</div>', unsafe_allow_html=True)
             else:
-                st.info("Aucun historique Supabase disponible.")
-    except Exception as e:
-        st.info(f"Historique Supabase indisponible : {e}")
+                st.markdown('<div class="qc-non-conforme">❌ CONFORMITÉ GLOBALE : NON CONFORME</div>', unsafe_allow_html=True)
 
-    local_history = st.session_state.get("recent_analyses", [])
-    if local_history:
-        st.markdown("### Historique de cette session")
-        for row in local_history:
-            with st.expander(f"📁 {row['patient_id']} - {row['diagnostic']}"):
-                st.write(f"**Âge :** {row.get('age', 'N/A')} | **Sexe :** {row.get('sexe', 'N/A')}")
-                st.write(f"**Qualité :** {row.get('conclusion_qc', 'N/A')}")
-                st.write(f"**Description :** {row.get('description', 'N/A')}")
+            st.markdown("### 🩺 Diagnostic")
+            st.markdown(f"**Conclusion :** {diag['conclusion']}")
+            st.markdown(f"**Description :** {diag['description_semiologique']}")
 
-    if history_rows:
-        st.markdown("### Validation radiologue différée")
-        selected_row = st.selectbox(
-            "Choisir une analyse à valider",
-            history_rows,
-            format_func=lambda row: f"{row.get('patient_id', 'Sans ID')} - IA: {row.get('diagnostic', 'N/A')} - QC: {row.get('conclusion_qc', 'N/A')}",
-        )
+            pathologies = data.get('annotations', {}).get('pathologies', [])
+            if pathologies:
+                st.markdown("**Anomalies :**")
+                for p in pathologies:
+                    st.markdown(f"- 🔴 **{p.get('label', 'Anomalie')}**")
 
-        if selected_row:
-            st.caption("Renseignez ici le compte rendu radiologue lorsque vous l'obtenez. La ligne Supabase existante sera mise à jour.")
-            champ_radio = st.selectbox(
-                "Champ radiographique radiologue",
-                ["OUI", "NON"],
-                key="champ_radio_validation",
-            )
-            sym_radio = st.selectbox(
-                "Symétrie radiologue",
-                ["OUI", "NON"],
-                key="sym_radio_validation",
-            )
-            insp_radio = st.selectbox(
-                "Inspiration radiologue",
-                ["OUI", "NON"],
-                key="insp_radio_validation",
-            )
-            qc_radio = "Conforme" if all(v == "OUI" for v in [champ_radio, sym_radio, insp_radio]) else "Non conforme"
-            diag_radio = st.selectbox(
-                "Diagnostic radiologue",
-                ["Normal", "Pathologique"],
-                key="diag_radio_validation",
-            )
-            commentaire_radio = st.text_area(
-                "Commentaire / conclusion radiologue",
-                key="commentaire_radio_validation",
-            )
-            afficher_conformite_globale(qc_radio)
-
-            if st.button("💾 Enregistrer la validation radiologue"):
-                update_data = {
-                    "champ_radiographique_radiologue": champ_radio,
-                    "symetrie_radiologue": sym_radio,
-                    "inspiration_radiologue": insp_radio,
-                    "conclusion_qc_radiologue": qc_radio,
-                    "diagnostic_radiologue": diag_radio,
-                    "commentaire_radiologue": commentaire_radio,
-                    "concordance_champ": concordance(selected_row.get("champ_radiographique"), champ_radio),
-                    "concordance_symetrie": concordance(selected_row.get("symetrie"), sym_radio),
-                    "concordance_inspiration": concordance(selected_row.get("inspiration"), insp_radio),
-                    "concordance_qc": concordance(selected_row.get("conclusion_qc"), qc_radio),
-                    "concordance_diagnostic": concordance(selected_row.get("diagnostic"), diag_radio),
-                    "statut_validation": "Validé",
-                }
-
-                try:
-                    query = supabase.table("analyses").update(update_data)
-                    if selected_row.get("id") is not None:
-                        query = query.eq("id", selected_row["id"])
-                    else:
-                        query = query.eq("patient_id", selected_row["patient_id"])
-                    query.execute()
-                    st.success("Validation radiologue enregistrée avec succès.")
-                    st.rerun()
-                except Exception as update_error:
-                    st.error(f"Impossible d'enregistrer la validation radiologue : {update_error}")
-
-    export_rows = history_rows if history_rows else local_history
-    if export_rows:
-        st.markdown("### Export des données")
-        export_df = pd.DataFrame(export_rows)
-
+        # Historique
+        st.divider()
+        st.subheader("📜 Historique")
         try:
-            excel_bytes = dataframe_to_excel_bytes(export_df)
-            st.download_button(
-                "📥 Télécharger en Excel (.xlsx)",
-                data=excel_bytes,
-                file_name="historique_analyses_radioia.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        except Exception as export_error:
-            st.warning(f"Export Excel indisponible : {export_error}")
+            history = supabase.table("analyses").select("*").order('created_at', desc=True).limit(15).execute()
+            if history.data:
+                for row in history.data:
+                    classif = row.get('classification', 'N/A')
+                    valide = row.get('valide_par_radiologue', False)
+                    emoji = "✅" if classif == "NORMAL" else "⚠️" if classif == "PATHOLOGIQUE" else "❓"
+                    badge = "✔ Validé" if valide else "⏳"
+                    conformite = row.get('conclusion_qc', 'N/A')
+                    
+                    with st.expander(f"{emoji} {row['patient_id']} — {classif} — {conformite} {badge}"):
+                        st.markdown(f"**Patient :** {row['patient_id']} | **Âge :** {row.get('age', 'N/A')} | **Sexe :** {row.get('sexe', 'N/A')}")
+                        st.markdown("---")
+                        r_champ = row.get('champ_radiographique', 'N/A')
+                        ic_champ = "✅" if r_champ == "OUI" else "❌"
+                        st.markdown(f"{ic_champ} **Champ :** {r_champ}")
+                        st.caption(f"{row.get('champ_justification', '')}")
+                        r_sym = row.get('symetrie', 'N/A')
+                        ic_sym = "✅" if r_sym == "OUI" else "❌"
+                        st.markdown(f"{ic_sym} **Symétrie :** {r_sym}")
+                        st.caption(f"{row.get('symetrie_justification', '')}")
+                        r_insp = row.get('inspiration', 'N/A')
+                        ic_insp = "✅" if r_insp == "OUI" else "❌"
+                        st.markdown(f"{ic_insp} **Inspiration :** {r_insp}")
+                        st.caption(f"{row.get('inspiration_justification', '')}")
+                        st.markdown(f"**Conformité :** {conformite}")
+                        st.markdown("---")
+                        st.markdown(f"**Classification :** {classif}")
+                        st.markdown(f"**Diagnostic :** {row.get('diagnostic', 'N/A')}")
+                        st.markdown(f"**Description :** {row.get('description', 'N/A')}")
+                        if valide:
+                            st.markdown("---")
+                            st.markdown("**👨‍⚕️ Avis Radiologue :**")
+                            st.markdown(f"Champ: {row.get('champ_radiologue', 'N/A')} | Symétrie: {row.get('symetrie_radiologue', 'N/A')} | Inspiration: {row.get('inspiration_radiologue', 'N/A')}")
+                            st.markdown(f"**Conformité :** {row.get('conformite_radiologue', 'N/A')}")
+                            st.markdown(f"**Classification :** {row.get('classification_radiologue', 'N/A')}")
+            else:
+                st.info("📭 Aucune analyse.")
+        except Exception as e:
+            st.warning(f"Historique indisponible : {e}")
 
-        csv_bytes = export_df.to_csv(index=False, sep=";").encode("utf-8-sig")
-        st.download_button(
-            "📥 Télécharger en CSV compatible SPSS",
-            data=csv_bytes,
-            file_name="historique_analyses_radioia_spss.csv",
-            mime="text/csv",
-        )
+# ══════════════════════════════════════════════════════
+# PAGE 2 : VALIDATION RADIOLOGUE
+# ══════════════════════════════════════════════════════
+elif page == "👨‍⚕️ Validation Radiologue":
+    st.markdown("# 👨‍⚕️ Validation par le Radiologue")
+    st.markdown("*Sélectionnez une analyse pour saisir l'avis du radiologue.*")
+    st.divider()
 
-        sav_bytes = dataframe_to_sav_bytes(export_df)
-        if sav_bytes:
-            st.download_button(
-                "📥 Télécharger en SPSS (.sav)",
-                data=sav_bytes,
-                file_name="historique_analyses_radioia.sav",
-                mime="application/octet-stream",
-            )
+    try:
+        analyses = supabase.table("analyses").select("*").order('created_at', desc=True).execute()
+
+        if not analyses.data:
+            st.info("📭 Aucune analyse à valider.")
         else:
-            st.caption("Pour obtenir un fichier SPSS .sav direct, ajoutez `pyreadstat` dans requirements.txt. Sinon, le CSV s'importe dans SPSS.")
+            filtre = st.radio("Filtrer", ["⏳ En attente", "✅ Validées", "📋 Toutes"], horizontal=True)
+
+            if filtre == "⏳ En attente":
+                liste = [r for r in analyses.data if not r.get('valide_par_radiologue', False)]
+            elif filtre == "✅ Validées":
+                liste = [r for r in analyses.data if r.get('valide_par_radiologue', False)]
+            else:
+                liste = analyses.data
+
+            if not liste:
+                st.info("Aucune analyse dans cette catégorie.")
+            else:
+                st.info(f"📁 **{len(liste)} analyse(s)**")
+
+                options = [f"{r['patient_id']} — {r.get('classification', 'N/A')} — {'✔' if r.get('valide_par_radiologue') else '⏳'}" for r in liste]
+                choix = st.selectbox("Sélectionner", options)
+                idx = options.index(choix)
+                row = liste[idx]
+
+                col_ia, col_radio = st.columns(2)
+
+                with col_ia:
+                    st.markdown("### 🤖 Résultat IA")
+                    st.markdown(f"**Patient :** {row['patient_id']}")
+                    st.markdown(f"**Âge :** {row.get('age', 'N/A')} | **Sexe :** {row.get('sexe', 'N/A')}")
+                    st.divider()
+                    st.markdown(f"**Champ :** {row.get('champ_radiographique', 'N/A')}")
+                    st.caption(row.get('champ_justification', ''))
+                    st.markdown(f"**Symétrie :** {row.get('symetrie', 'N/A')}")
+                    st.caption(row.get('symetrie_justification', ''))
+                    st.markdown(f"**Inspiration :** {row.get('inspiration', 'N/A')}")
+                    st.caption(row.get('inspiration_justification', ''))
+                    st.divider()
+                    st.markdown(f"**Conformité IA :** {row.get('conclusion_qc', 'N/A')}")
+                    st.markdown(f"**Classification IA :** {row.get('classification', 'N/A')}")
+                    st.markdown(f"**Diagnostic :** {row.get('diagnostic', 'N/A')}")
+
+                with col_radio:
+                    st.markdown("### 👨‍⚕️ Avis Radiologue")
+
+                    with st.form(f"form_validation_{row['id']}"):
+                        r_champ = st.selectbox("Champ", ["OUI", "NON"], index=0 if row.get('champ_radiologue', 'OUI') == 'OUI' else 1)
+                        r_sym = st.selectbox("Symétrie", ["OUI", "NON"], index=0 if row.get('symetrie_radiologue', 'OUI') == 'OUI' else 1)
+                        r_insp = st.selectbox("Inspiration", ["OUI", "NON"], index=0 if row.get('inspiration_radiologue', 'OUI') == 'OUI' else 1)
+
+                        if r_champ == "OUI" and r_sym == "OUI" and r_insp == "OUI":
+                            conformite_radio = "Conforme"
+                        else:
+                            conformite_radio = "Non conforme"
+                        st.markdown(f"**Conformité : {conformite_radio}**")
+
+                        r_classif = st.selectbox("Classification", ["NORMAL", "PATHOLOGIQUE"], index=0 if row.get('classification_radiologue', 'NORMAL') == 'NORMAL' else 1)
+                        r_conclusion = st.text_area("Conclusion", value=row.get('conclusion_qc_radiologue', ''))
+
+                        if st.form_submit_button("💾 SAUVEGARDER"):
+                            try:
+                                supabase.table("analyses").update({
+                                    "champ_radiologue": r_champ,
+                                    "symetrie_radiologue": r_sym,
+                                    "inspiration_radiologue": r_insp,
+                                    "conformite_radiologue": conformite_radio,
+                                    "classification_radiologue": r_classif,
+                                    "conclusion_qc_radiologue": r_conclusion,
+                                    "valide_par_radiologue": True,
+                                    "date_validation": datetime.now().isoformat()
+                                }).eq('id', row['id']).execute()
+
+                                st.success(f"✅ Avis sauvegardé pour {row['patient_id']} !")
+                                st.rerun()
+
+                            except Exception as e:
+                                st.error(f"Erreur : {e}")
+
+                if row.get('valide_par_radiologue', False):
+                    st.divider()
+                    st.markdown("### 📊 Concordance IA vs Radiologue")
+                    concordances = {
+                        "Champ": (row.get('champ_radiographique'), row.get('champ_radiologue')),
+                        "Symétrie": (row.get('symetrie'), row.get('symetrie_radiologue')),
+                        "Inspiration": (row.get('inspiration'), row.get('inspiration_radiologue')),
+                        "Conformité": (row.get('conclusion_qc'), row.get('conformite_radiologue')),
+                        "Classification": (row.get('classification'), row.get('classification_radiologue')),
+                    }
+                    cols = st.columns(5)
+                    for i, (critere, (ia, radio)) in enumerate(concordances.items()):
+                        with cols[i]:
+                            accord = "✅" if ia == radio else "❌"
+                            st.metric(critere, accord)
+
+    except Exception as e:
+        st.error(f"Erreur : {e}")
+
+# ══════════════════════════════════════════════════════
+# PAGE 3 : EXPORT
+# ══════════════════════════════════════════════════════
+elif page == "📊 Export & Statistiques":
+    st.markdown("# 📊 Export & Statistiques")
+    st.divider()
+
+    try:
+        history = supabase.table("analyses").select("*").order('created_at', desc=True).execute()
+
+        if not history.data:
+            st.info("📭 Aucune donnée.")
+        else:
+            df = pd.DataFrame(history.data)
+
+            total = len(df)
+            valides = len(df[df['valide_par_radiologue'] == True]) if 'valide_par_radiologue' in df.columns else 0
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total", total)
+            col2.metric("Validées", valides)
+            col3.metric("En attente", total - valides)
+
+            if valides > 0:
+                st.markdown("### 📈 Concordance globale")
+                df_v = df[df['valide_par_radiologue'] == True]
+                for critere, col_ia, col_r in [
+                    ("Champ", "champ_radiographique", "champ_radiologue"),
+                    ("Symétrie", "symetrie", "symetrie_radiologue"),
+                    ("Inspiration", "inspiration", "inspiration_radiologue"),
+                    ("Conformité", "conclusion_qc", "conformite_radiologue"),
+                    ("Classification", "classification", "classification_radiologue"),
+                ]:
+                    if col_ia in df_v.columns and col_r in df_v.columns:
+                        accords = (df_v[col_ia] == df_v[col_r]).sum()
+                        taux = round(accords / len(df_v) * 100, 1)
+                        st.write(f"**{critere}** : {accords}/{len(df_v)} ({taux}%)")
+
+            st.markdown("---")
+            st.markdown("### 💾 Exporter")
+
+            colonnes = {
+                'patient_id': 'ID', 'age': 'Age', 'sexe': 'Sexe',
+                'champ_radiographique': 'Champ_IA', 'symetrie': 'Sym_IA', 'inspiration': 'Insp_IA',
+                'conclusion_qc': 'Conf_IA', 'classification': 'Class_IA',
+                'champ_radiologue': 'Champ_R', 'symetrie_radiologue': 'Sym_R', 'inspiration_radiologue': 'Insp_R',
+                'conformite_radiologue': 'Conf_R', 'classification_radiologue': 'Class_R',
+                'valide_par_radiologue': 'Valide', 'created_at': 'Date'
+            }
+            cols_export = [c for c in colonnes if c in df.columns]
+            df_exp = df[cols_export].rename(columns=colonnes)
+
+            # Codes numériques
+            for col, code in [('Champ_IA', 'Champ_IA_C'), ('Sym_IA', 'Sym_IA_C'), ('Insp_IA', 'Insp_IA_C')]:
+                if col in df_exp.columns:
+                    df_exp[code] = df_exp[col].apply(lambda x: 1 if str(x).upper() == 'OUI' else 0)
+            if 'Conf_IA' in df_exp.columns:
+                df_exp['Conf_IA_C'] = df_exp['Conf_IA'].apply(lambda x: 1 if 'conforme' in str(x).lower() and 'non' not in str(x).lower() else 0)
+            if 'Class_IA' in df_exp.columns:
+                df_exp['Class_IA_C'] = df_exp['Class_IA'].apply(lambda x: 1 if str(x).upper() == 'NORMAL' else 0)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine='openpyxl') as w:
+                    df_exp.to_excel(w, index=False)
+                buf.seek(0)
+                st.download_button("📗 Excel", buf, f"radioia_{datetime.now().strftime('%Y%m%d')}.xlsx")
+
+            with col_b:
+                csv = df_exp.to_csv(index=False, sep=';')
+                st.download_button("📊 CSV (SPSS)", csv, f"radioia_{datetime.now().strftime('%Y%m%d')}.csv")
+
+            with st.expander("👁️ Aperçu"):
+                st.dataframe(df_exp, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Erreur : {e}")
+        
